@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import logging
 
 from db import ensure_indexes, close
-# from seed import bootstrap
+from seed import bootstrap
 from routers.auth import router as auth_router
 from routers.clients import router as clients_router
 from routers.sms import router as sms_router
