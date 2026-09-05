@@ -64,4 +64,4 @@ app.include_router(share_router)
 
 @app.get('/api/')
 async def root():
-    return {'service': 'Delivery Centre API', 'status': 'ok'}
+    return {'service': 'Delivery Centre API', 'status': 'okk'}
