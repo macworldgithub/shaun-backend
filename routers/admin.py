@@ -127,6 +127,11 @@ async def stats(_: User = Depends(get_current_user)):
     })
     not_contacted = await db.clients.count_documents({'contact_status': 'Not Contacted'})
     unassigned = await db.clients.count_documents({'$or': [{'assigned_agent_id': None}, {'assigned_agent_id': ''}]})
+    docs_outstanding = await db.clients.count_documents({'document_completeness': {'$in': ['Requested', 'Partial']}})
+    offers_at_risk = await db.clients.count_documents({'offer_status': {'$in': ['At risk', 'Ineligible']}})
+    trade_ins_at_risk = await db.clients.count_documents({'trade_in_status': {'$in': ['Expiring', 'Expired']}})
+    ready_to_register = await db.clients.count_documents({'registration_status': 'Ready to register'})
+    ready_to_handover = await db.clients.count_documents({'handover_checklist_status': 'Signed copy on file', 'activation_ready': False})
     sms_count = await db.messages.count_documents({})
     return {
         'total_clients': total,
@@ -135,6 +140,11 @@ async def stats(_: User = Depends(get_current_user)):
         'not_contacted': not_contacted,
         'unassigned': unassigned,
         'sms_total': sms_count,
+        'docs_outstanding': docs_outstanding,
+        'offers_at_risk': offers_at_risk,
+        'trade_ins_at_risk': trade_ins_at_risk,
+        'ready_to_register': ready_to_register,
+        'ready_to_handover': ready_to_handover,
     }
 
 

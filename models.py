@@ -1,6 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
-from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from pydantic import BaseModel, Field, EmailStr, ConfigDict, model_validator
 import uuid
 
 
@@ -64,6 +64,15 @@ class TokenResponse(BaseModel):
 # ===== CLIENTS =====
 DeliveryStage = Literal['Scheduled', 'Pre-Delivery Inspection', 'In Transit', 'Ready for Pickup', 'Delivered']
 ContactStatus = Literal['Not Contacted', 'Contacted', 'Booked', 'Awaiting Reply']
+RegistrationStatus = Literal['Awaiting registration documents', 'Awaiting VIN', 'Ready to register', 'Partial', 'Complete']
+DocumentType = Literal['ATR signed', 'ATR incomplete', 'Licence front', 'Licence back', 'EFT form', 'Bank statement', 'Handover checklist', 'Other']
+HandoverChecklistStatus = Literal['Not issued', 'Issued in VY', 'Signed copy on file', 'Exception']
+OfferStatus = Literal['Eligible', 'At risk', 'Ineligible']
+DocumentCompleteness = Literal['Requested', 'Partial', 'Complete']
+TradeInStatus = Literal['Pending', 'Quoted', 'Accepted', 'Vehicle received', 'Settled', 'Valid', 'Expiring soon', 'Expiring', 'Expired', 'Cancelled']
+SaleType = Literal['Retail', 'Lease', 'Novated', 'Novated lease', 'Fleet', 'Government', 'Rental', 'Cash', 'Demo', 'Other']
+RegisteredOperatorType = Literal['Individual', 'Company']
+ActivationStatus = Literal['Blocked', 'Ready', 'Submitted to BYD', 'Active']
 
 
 class Comment(BaseModel):
@@ -89,13 +98,44 @@ class ClientBase(BaseModel):
     vehicle: str
     rego: Optional[str] = None
     vin: Optional[str] = None
+    po_number: Optional[str] = None
+    payment_method: Optional[str] = None  # Cash / Finance / Novated lease / Other
+    order_date: Optional[str] = None
+    sale_type: SaleType = 'Retail'
+    fleet_company: Optional[str] = None
+    fleet_reference: Optional[str] = None
+    lease_consultant: Optional[str] = None
+    registered_operator_type: RegisteredOperatorType = 'Individual'
+    trade_in_flag: bool = False
+    trade_in_attached: bool = False
+    trade_in_sale_date: Optional[str] = None
+    trade_in_valid_until: Optional[str] = None
+    trade_in_status: TradeInStatus = 'Pending'
+    trade_in_manager_reason: Optional[str] = None
+    trade_in_override_by: Optional[str] = None
+    trade_in_override_at: Optional[datetime] = None
+    linked_offer_ids: List[str] = Field(default_factory=list)
+    your_way_selection: Optional[Literal['Cashback', 'Accessories', 'Car care', 'Merchandise', 'Charging', 'Other']] = None
+    your_way_note: Optional[str] = None
+    registration_status: RegistrationStatus = 'Awaiting registration documents'
+    registration_docs_complete: bool = False
+    handover_checklist_status: HandoverChecklistStatus = 'Not issued'
+    activation_ready: bool = False
+    activation_status: ActivationStatus = 'Blocked'
+    activation_override_reason: Optional[str] = None
+    activation_override_by: Optional[str] = None
+    activation_override_at: Optional[datetime] = None
+    offer_status: OfferStatus = 'Eligible'
+    offer_reason: Optional[str] = None
+    documents: List[dict] = Field(default_factory=list)
+    document_completeness: DocumentCompleteness = 'Requested'
+    deal_type: Optional[str] = None
     delivery_date: Optional[str] = None  # ISO yyyy-mm-dd
     stage: DeliveryStage = 'Scheduled'
     salesperson: Optional[str] = None
     notes: Optional[str] = None
     address: Optional[str] = None
     location: Optional[str] = None  # suburb / state for at-a-glance
-    deal_type: Optional[str] = None
     # VY ingestion
     vy_order_id: Optional[str] = None
     vy_stock_id: Optional[str] = None
@@ -115,6 +155,85 @@ class ClientBase(BaseModel):
     imported_from: Optional[str] = None  # 'paste' | 'email' | 'manual'
     imported_at: Optional[datetime] = None
 
+    @model_validator(mode='after')
+    def sync_activation_state(self):
+        if self.activation_status in ('Ready', 'Submitted to BYD', 'Active'):
+            self.activation_ready = True
+        elif self.activation_status == 'Blocked':
+            self.activation_ready = False
+        if self.trade_in_attached and self.trade_in_sale_date and not self.trade_in_valid_until:
+            try:
+                sale_date = datetime.strptime(self.trade_in_sale_date, '%Y-%m-%d').date()
+                self.trade_in_valid_until = (sale_date + timedelta(days=30)).isoformat()
+            except ValueError:
+                pass
+        if self.trade_in_valid_until and self.trade_in_valid_until < datetime.now(timezone.utc).date().isoformat() and self.trade_in_status in ('Pending', 'Valid', 'Expiring soon', 'Expiring'):
+            self.trade_in_status = 'Expired'
+        return self
+
+
+class ClientDocument(BaseModel):
+    id: str = Field(default_factory=_id)
+    client_id: Optional[str] = None
+    document_type: DocumentType = 'Other'
+    status: Literal['requested', 'partial', 'complete', 're-requested'] = 'requested'
+    file_name: Optional[str] = None
+    source: Literal['email', 'staff-upload', 'vy', 'manual'] = 'manual'
+    uploaded_by: Optional[str] = None
+    storage_path: Optional[str] = None
+    content_type: Optional[str] = None
+    size_bytes: Optional[int] = None
+    sent_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_now)
+    notes: Optional[str] = None
+    signature_present: bool = False
+    date_left_blank: Optional[bool] = None
+    customer_present: Optional[bool] = None
+    bank_name: Optional[str] = None
+    bsb: Optional[str] = None
+    account_number: Optional[str] = None
+    amount: Optional[float] = None
+    reference: Optional[str] = None
+    bank_statement_received: bool = False
+
+
+class ClientDocumentUpdate(BaseModel):
+    document_type: Optional[DocumentType] = None
+    status: Optional[Literal['requested', 'partial', 'complete', 're-requested']] = None
+    file_name: Optional[str] = None
+    source: Optional[Literal['email', 'staff-upload', 'vy', 'manual']] = None
+    notes: Optional[str] = None
+    signature_present: Optional[bool] = None
+    date_left_blank: Optional[bool] = None
+    customer_present: Optional[bool] = None
+    bank_name: Optional[str] = None
+    bsb: Optional[str] = None
+    account_number: Optional[str] = None
+    amount: Optional[float] = None
+    reference: Optional[str] = None
+    bank_statement_received: Optional[bool] = None
+
+
+class OfferRecord(BaseModel):
+    id: str = Field(default_factory=_id)
+    name: str
+    eligible_models: List[str] = Field(default_factory=list)
+    order_from: Optional[str] = None
+    order_to: Optional[str] = None
+    deliver_by: Optional[str] = None
+    honour_if_delayed: bool = False
+    sale_type_exclusions: List[str] = Field(default_factory=list)
+    combinable: bool = True
+    claim_doc_template: Optional[str] = None
+    claim_doc_templates: List[str] = Field(default_factory=list)
+    cash_or_product: Literal['cash', 'product', 'both'] = 'cash'
+    public_url: Optional[str] = None
+    internal_notes: Optional[str] = None
+    active: bool = True
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+    last_refreshed_at: Optional[datetime] = None
+
 
 class Client(ClientBase):
     model_config = ConfigDict(populate_by_name=True)
@@ -132,6 +251,30 @@ class ClientUpdate(BaseModel):
     vehicle: Optional[str] = None
     rego: Optional[str] = None
     vin: Optional[str] = None
+    po_number: Optional[str] = None
+    payment_method: Optional[str] = None
+    order_date: Optional[str] = None
+    sale_type: Optional[SaleType] = None
+    fleet_company: Optional[str] = None
+    fleet_reference: Optional[str] = None
+    lease_consultant: Optional[str] = None
+    registered_operator_type: Optional[RegisteredOperatorType] = None
+    trade_in_flag: Optional[bool] = None
+    trade_in_attached: Optional[bool] = None
+    trade_in_sale_date: Optional[str] = None
+    trade_in_valid_until: Optional[str] = None
+    trade_in_status: Optional[TradeInStatus] = None
+    trade_in_manager_reason: Optional[str] = None
+    linked_offer_ids: Optional[List[str]] = None
+    your_way_selection: Optional[Literal['Cashback', 'Accessories', 'Car care', 'Merchandise', 'Charging', 'Other']] = None
+    your_way_note: Optional[str] = None
+    registration_status: Optional[RegistrationStatus] = None
+    registration_docs_complete: Optional[bool] = None
+    handover_checklist_status: Optional[HandoverChecklistStatus] = None
+    activation_ready: Optional[bool] = None
+    activation_status: Optional[ActivationStatus] = None
+    offer_status: Optional[OfferStatus] = None
+    offer_reason: Optional[str] = None
     delivery_date: Optional[str] = None
     stage: Optional[DeliveryStage] = None
     salesperson: Optional[str] = None
@@ -144,6 +287,40 @@ class ClientUpdate(BaseModel):
     assigned_agent_id: Optional[str] = None
     aftermarket_notes: Optional[str] = None
     addons: Optional[List[str]] = None
+
+
+class OfferCreate(BaseModel):
+    name: str
+    eligible_models: List[str] = Field(default_factory=list)
+    order_from: Optional[str] = None
+    order_to: Optional[str] = None
+    deliver_by: Optional[str] = None
+    honour_if_delayed: bool = False
+    sale_type_exclusions: List[str] = Field(default_factory=list)
+    combinable: bool = True
+    claim_doc_template: Optional[str] = None
+    claim_doc_templates: List[str] = Field(default_factory=list)
+    cash_or_product: Literal['cash', 'product', 'both'] = 'cash'
+    public_url: Optional[str] = None
+    internal_notes: Optional[str] = None
+    active: bool = True
+
+
+class OfferUpdate(BaseModel):
+    name: Optional[str] = None
+    eligible_models: Optional[List[str]] = None
+    order_from: Optional[str] = None
+    order_to: Optional[str] = None
+    deliver_by: Optional[str] = None
+    honour_if_delayed: Optional[bool] = None
+    sale_type_exclusions: Optional[List[str]] = None
+    combinable: Optional[bool] = None
+    claim_doc_template: Optional[str] = None
+    claim_doc_templates: Optional[List[str]] = None
+    cash_or_product: Optional[Literal['cash', 'product', 'both']] = None
+    public_url: Optional[str] = None
+    internal_notes: Optional[str] = None
+    active: Optional[bool] = None
 
 
 class CommentCreate(BaseModel):
@@ -258,3 +435,5 @@ class ShareAccessResponse(BaseModel):
     access_token: str
     label: str
     expires_at: Optional[datetime] = None
+
+
