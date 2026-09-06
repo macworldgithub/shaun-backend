@@ -217,6 +217,15 @@ class ClientDocumentUpdate(BaseModel):
 class OfferRecord(BaseModel):
     id: str = Field(default_factory=_id)
     name: str
+    source_key: Optional[str] = None
+    model_variant: Optional[str] = None
+    body_style: Optional[str] = None
+    powertrain: Optional[str] = None
+    display_value: Optional[str] = None
+    display_unit: Optional[str] = None
+    image_url: Optional[str] = None
+    configurator_url: Optional[str] = None
+    source_url: Optional[str] = None
     eligible_models: List[str] = Field(default_factory=list)
     order_from: Optional[str] = None
     order_to: Optional[str] = None
@@ -291,6 +300,15 @@ class ClientUpdate(BaseModel):
 
 class OfferCreate(BaseModel):
     name: str
+    source_key: Optional[str] = None
+    model_variant: Optional[str] = None
+    body_style: Optional[str] = None
+    powertrain: Optional[str] = None
+    display_value: Optional[str] = None
+    display_unit: Optional[str] = None
+    image_url: Optional[str] = None
+    configurator_url: Optional[str] = None
+    source_url: Optional[str] = None
     eligible_models: List[str] = Field(default_factory=list)
     order_from: Optional[str] = None
     order_to: Optional[str] = None
@@ -308,6 +326,15 @@ class OfferCreate(BaseModel):
 
 class OfferUpdate(BaseModel):
     name: Optional[str] = None
+    source_key: Optional[str] = None
+    model_variant: Optional[str] = None
+    body_style: Optional[str] = None
+    powertrain: Optional[str] = None
+    display_value: Optional[str] = None
+    display_unit: Optional[str] = None
+    image_url: Optional[str] = None
+    configurator_url: Optional[str] = None
+    source_url: Optional[str] = None
     eligible_models: Optional[List[str]] = None
     order_from: Optional[str] = None
     order_to: Optional[str] = None

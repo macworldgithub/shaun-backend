@@ -36,6 +36,7 @@ async def ensure_indexes():
     await db.share_links.create_index('token', unique=True)
     await db.upload_links.create_index('token', unique=True)
     await db.upload_links.create_index('client_id')
+    await db.offers.create_index('source_key', unique=True, sparse=True)
     await db.offer_snapshots.create_index([('fetched_at', -1)])
     await db.share_views.create_index([('share_link_id', 1), ('viewed_at', -1)])
     await db.audit.create_index([('created_at', -1)])
