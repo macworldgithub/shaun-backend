@@ -1284,6 +1284,44 @@ async def delete_accessory(
     return {'success': res.modified_count > 0}
 
 
+@router.post('/{client_id}/sync-inventory')
+async def sync_inventory(client_id: str, user: User = Depends(get_current_user)):
+    db = get_db()
+    client = await db.clients.find_one({'id': client_id})
+    if not client:
+        raise HTTPException(404, 'Client not found')
+
+    existing = {a.get('name', '').strip().lower() for a in client.get('accessories', []) if a.get('name')}
+    new_accs = []
+
+    # Pull from legacy addons list
+    for addon in client.get('addons', []):
+        if addon and addon.strip().lower() not in existing:
+            new_accs.append(Accessory(name=addon.strip(), status='Pending Order').model_dump(mode='json'))
+            existing.add(addon.strip().lower())
+
+    # Check notes and aftermarket fields for accessories
+    notes_combined = f"{client.get('notes') or ''} {client.get('aftermarket_notes') or ''} {client.get('your_way_note') or ''}"
+    default_items = ['Floor Mats Moulded', 'Boot Liner', 'Tinting', 'Dash Cam', 'Paint Protection', 'Tow Bar', 'Wall Charger']
+    for item in default_items:
+        if item.lower() in notes_combined.lower() and item.lower() not in existing:
+            new_accs.append(Accessory(name=item, status='Pending Order').model_dump(mode='json'))
+            existing.add(item.lower())
+
+    if new_accs:
+        await db.clients.update_one(
+            {'id': client_id},
+            {
+                '$push': {'accessories': {'$each': new_accs}},
+                '$set': {'updated_at': datetime.now(timezone.utc)},
+            }
+        )
+
+    updated = await db.clients.find_one({'id': client_id})
+    updated.pop('_id', None)
+    return Client(**updated)
+
+
 # ---------------------------------------------------------------------------
 # Documents
 # ---------------------------------------------------------------------------

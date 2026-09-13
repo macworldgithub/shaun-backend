@@ -111,5 +111,7 @@ async def send_sms(to: str, body: str, custom_ref: Optional[str] = None) -> dict
 def render_template(body: str, data: dict) -> str:
     out = body
     for k, v in data.items():
-        out = out.replace('{{' + k + '}}', str(v) if v is not None else '')
+        val = str(v) if v is not None else ''
+        out = out.replace('{{' + k + '}}', val)
+        out = out.replace('{' + k + '}', val)
     return out

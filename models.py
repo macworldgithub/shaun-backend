@@ -22,6 +22,8 @@ class User(BaseModel):
     email: EmailStr
     name: str
     role: UserRole = 'agent'
+    team: Optional[str] = 'All Teams'
+    active_site: Optional[str] = 'Fairfield'
     active: bool = True
     created_at: datetime = Field(default_factory=_now)
     last_login_at: Optional[datetime] = None
@@ -36,12 +38,16 @@ class UserCreate(BaseModel):
     email: EmailStr
     name: str
     role: UserRole = 'agent'
+    team: Optional[str] = 'All Teams'
+    active_site: Optional[str] = 'Fairfield'
     password: Optional[str] = None  # if None, server generates
 
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     role: Optional[UserRole] = None
+    team: Optional[str] = None
+    active_site: Optional[str] = None
     active: Optional[bool] = None
 
 
@@ -65,7 +71,7 @@ class TokenResponse(BaseModel):
 DeliveryStage = Literal['Scheduled', 'Pre-Delivery Inspection', 'In Transit', 'Ready for Pickup', 'Delivered']
 ContactStatus = Literal['Not Contacted', 'Contacted', 'Booked', 'Awaiting Reply']
 RegistrationStatus = Literal['Awaiting registration documents', 'Awaiting VIN', 'Ready to register', 'Partial', 'Complete']
-DocumentType = Literal['ATR signed', 'ATR incomplete', 'Licence front', 'Licence back', 'EFT form', 'Bank statement', 'Handover checklist', 'Other']
+DocumentType = Literal['ATR signed', 'ATR incomplete', 'Licence front', 'Licence back', 'EFT form', 'Bank statement', 'Handover checklist', 'Medicare card', 'Transfer form', 'Acquisition police strip', 'Customer trade-in checklist', 'Other']
 HandoverChecklistStatus = Literal['Not issued', 'Issued in VY', 'Signed copy on file', 'Exception']
 OfferStatus = Literal['Eligible', 'At risk', 'Ineligible']
 DocumentCompleteness = Literal['Requested', 'Partial', 'Complete']
@@ -133,6 +139,9 @@ class ClientBase(BaseModel):
     delivery_date: Optional[str] = None  # ISO yyyy-mm-dd
     stage: DeliveryStage = 'Scheduled'
     salesperson: Optional[str] = None
+    secondary_salesperson: Optional[str] = None
+    delivery_consultant: Optional[str] = None
+    handover_specialist: Optional[str] = None
     notes: Optional[str] = None
     address: Optional[str] = None
     location: Optional[str] = None  # suburb / state for at-a-glance
@@ -152,6 +161,9 @@ class ClientBase(BaseModel):
     accessories: List[Accessory] = Field(default_factory=list)
     aftermarket_notes: Optional[str] = None
     addons: List[str] = Field(default_factory=list)  # legacy short list
+    trade_in_valuation: Optional[float] = 0.0
+    site_location: Optional[str] = 'Fairfield'
+    business_client_id: Optional[str] = None
     imported_from: Optional[str] = None  # 'paste' | 'email' | 'manual'
     imported_at: Optional[datetime] = None
 
@@ -164,7 +176,14 @@ class ClientBase(BaseModel):
         if self.trade_in_attached and self.trade_in_sale_date and not self.trade_in_valid_until:
             try:
                 sale_date = datetime.strptime(self.trade_in_sale_date, '%Y-%m-%d').date()
-                self.trade_in_valid_until = (sale_date + timedelta(days=30)).isoformat()
+                # Group policy rules: Non-Fairfield sites hold >$30k for 7 days, <=$30k for 14 days; Fairfield holds 30 days
+                site = (self.site_location or 'Fairfield').strip().lower()
+                val = self.trade_in_valuation or 0.0
+                if 'fairfield' not in site:
+                    days = 7 if val > 30000 else 14
+                else:
+                    days = 30
+                self.trade_in_valid_until = (sale_date + timedelta(days=days)).isoformat()
             except ValueError:
                 pass
         if self.trade_in_valid_until and self.trade_in_valid_until < datetime.now(timezone.utc).date().isoformat() and self.trade_in_status in ('Pending', 'Valid', 'Expiring soon', 'Expiring'):
@@ -296,6 +315,12 @@ class ClientUpdate(BaseModel):
     assigned_agent_id: Optional[str] = None
     aftermarket_notes: Optional[str] = None
     addons: Optional[List[str]] = None
+    trade_in_valuation: Optional[float] = None
+    site_location: Optional[str] = None
+    business_client_id: Optional[str] = None
+    secondary_salesperson: Optional[str] = None
+    delivery_consultant: Optional[str] = None
+    handover_specialist: Optional[str] = None
 
 
 class OfferCreate(BaseModel):
