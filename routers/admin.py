@@ -144,6 +144,7 @@ async def stats(_: User = Depends(get_current_user)):
     trade_ins_at_risk = await db.clients.count_documents({'trade_in_status': {'$in': ['Expiring', 'Expired', 'At risk']}})
     ready_to_register = await db.clients.count_documents({'registration_status': 'Ready to register'})
     ready_to_handover = await db.clients.count_documents({'handover_checklist_status': 'Signed copy on file', 'activation_ready': False})
+    ready_for_delivery = await db.clients.count_documents({'ready_for_delivery': True, 'stage': {'$ne': 'Delivered'}})
 
     # Leak prevention exceptions
     unallocated_stock = await db.clients.count_documents({
@@ -195,6 +196,7 @@ async def stats(_: User = Depends(get_current_user)):
         'trade_ins_at_risk': trade_ins_at_risk,
         'ready_to_register': ready_to_register,
         'ready_to_handover': ready_to_handover,
+        'ready_for_delivery': ready_for_delivery,
         'unallocated_stock': unallocated_stock,
         'overdue_updates': overdue_updates,
         'recent_messages': recent_messages,

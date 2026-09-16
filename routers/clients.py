@@ -16,10 +16,12 @@ from models import (
     Client, ClientBase, ClientUpdate, Comment, CommentCreate,
     Accessory, AccessoryCreate, AccessoryUpdate, User,
     ClientDocument, ClientDocumentUpdate, DocumentType, OfferRecord, OfferCreate, OfferUpdate,
+    DeliveryInspection, DeliveryInspectionUpdate,
 )
 from auth import get_current_user, require_admin
 from services.email import send_email
 from services.storage import put_bytes, get_bytes, exists
+from services.inspection_pdf import generate_inspection_pdf
 
 router = APIRouter(prefix='/api/clients', tags=['clients'])
 
@@ -691,14 +693,7 @@ async def update_client(
         for k, v in payload.model_dump(exclude_unset=True).items()
         if v is not None or k in ('assigned_agent_id', 'aftermarket_notes', 'address', 'location', 'email', 'salesperson')
     }
-    existing = await db.clients.find_one(
-        {'id': client_id},
-        {
-            'handover_checklist_status': 1, 'activation_ready': 1,
-            'sale_type': 1, 'fleet_company': 1, 'documents': 1,
-            'trade_in_valid_until': 1, 'your_way_selection': 1,
-        },
-    )
+    existing = await db.clients.find_one({'id': client_id})
     if not existing:
         raise HTTPException(404, 'Client not found')
     _validate_sale_type(
@@ -758,6 +753,16 @@ async def update_client(
         update['arrived_at'] = datetime.now(timezone.utc)
     if 'contact_status' in update and update['contact_status'] in ('Contacted', 'Booked', 'Awaiting Reply'):
         update['last_contacted_at'] = datetime.now(timezone.utc)
+
+    # Compute ready_for_delivery
+    merged_all = {**existing, **update}
+    payment_ok = bool(merged_all.get('payment_complete'))
+    has_trade_in = bool(merged_all.get('trade_in_flag') or merged_all.get('trade_in_attached'))
+    trade_in_ok = (not has_trade_in) or bool(merged_all.get('trade_in_docs_complete')) or (merged_all.get('trade_in_status') in ('Settled', 'Accepted', 'Vehicle received', 'Valid'))
+    pdi_ok = bool(merged_all.get('pdi_complete')) or (merged_all.get('stage') in ('Ready for Pickup', 'Delivered'))
+    rego_ok = bool(merged_all.get('registration_docs_complete')) or (merged_all.get('registration_status') == 'Complete') or (merged_all.get('document_completeness') == 'Complete')
+    update['ready_for_delivery'] = bool(payment_ok and trade_in_ok and pdi_ok and rego_ok)
+
     update['updated_at'] = datetime.now(timezone.utc)
     res = await db.clients.find_one_and_update(
         {'id': client_id}, {'$set': update}, return_document=True,
@@ -1489,3 +1494,170 @@ async def update_client_document(
         'created_at': datetime.now(timezone.utc),
     })
     return ClientDocument(**document)
+
+
+# ---------------------------------------------------------------------------
+# Delivery Inspection & Digital Handover Checklist
+# ---------------------------------------------------------------------------
+
+@router.get('/{client_id}/inspection', response_model=DeliveryInspection)
+async def get_client_inspection(client_id: str, user: User = Depends(get_current_user)):
+    db = get_db()
+    client = await db.clients.find_one({'id': client_id})
+    if not client:
+        raise HTTPException(404, 'Client not found')
+    
+    inspection_doc = await db.inspections.find_one({'client_id': client_id})
+    if inspection_doc:
+        return DeliveryInspection(**_strip(inspection_doc))
+    
+    # Auto-initialize default inspection draft
+    fitted_accessories = [a.get('name') for a in client.get('accessories', []) if a.get('name')]
+    if not fitted_accessories:
+        fitted_accessories = ['Floor Mats Moulded (Deep Dish)', 'Ceramic Window Tint (2x Front)']
+
+    new_inspection = DeliveryInspection(
+        client_id=client_id,
+        order_no=client.get('vy_order_id') or '',
+        salesperson=client.get('salesperson') or '',
+        customer_name=client.get('name') or '',
+        company_name=client.get('fleet_company') or '',
+        address=client.get('address') or client.get('location') or '',
+        phone=client.get('phone') or '',
+        vehicle=client.get('vehicle') or '',
+        rego_stock=client.get('rego') or client.get('vy_stock_id') or '',
+        vin=client.get('vin') or '',
+        fitted_accessories=fitted_accessories,
+        salesperson_name=client.get('salesperson') or '',
+        specialist_name=client.get('handover_specialist') or user.name or '',
+        status='draft'
+    )
+    await db.inspections.insert_one(new_inspection.model_dump(mode='json'))
+    return new_inspection
+
+
+@router.put('/{client_id}/inspection', response_model=DeliveryInspection)
+async def update_client_inspection(
+    client_id: str,
+    payload: DeliveryInspectionUpdate,
+    user: User = Depends(get_current_user)
+):
+    db = get_db()
+    client = await db.clients.find_one({'id': client_id})
+    if not client:
+        raise HTTPException(404, 'Client not found')
+    
+    update = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+    update['updated_at'] = datetime.now(timezone.utc)
+    if 'status' not in update:
+        update['status'] = 'in_progress'
+
+    res = await db.inspections.find_one_and_update(
+        {'client_id': client_id},
+        {'$set': update},
+        upsert=True,
+        return_document=True
+    )
+    return DeliveryInspection(**_strip(res))
+
+
+@router.post('/{client_id}/inspection/complete')
+async def complete_client_inspection(
+    client_id: str,
+    payload: Optional[DeliveryInspectionUpdate] = None,
+    user: User = Depends(get_current_user)
+):
+    db = get_db()
+    client = await db.clients.find_one({'id': client_id})
+    if not client:
+        raise HTTPException(404, 'Client not found')
+
+    update = {}
+    if payload:
+        update = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+    
+    now = datetime.now(timezone.utc)
+    update['status'] = 'completed'
+    update['completed_at'] = now
+    update['completed_by'] = user.name or user.email
+    update['updated_at'] = now
+
+    inspection_doc = await db.inspections.find_one_and_update(
+        {'client_id': client_id},
+        {'$set': update},
+        upsert=True,
+        return_document=True
+    )
+
+    # Generate official PDF matching delivery-inspection.pdf
+    pdf_bytes = generate_inspection_pdf(_strip(inspection_doc), client)
+    file_name = f'delivery-inspection-{now.strftime("%Y%m%d%H%M%S")}.pdf'
+    storage_path = f'{client_id}/{file_name}'
+    await put_bytes(storage_path, pdf_bytes, 'application/pdf')
+
+    # Update inspection with PDF storage path
+    await db.inspections.update_one({'client_id': client_id}, {'$set': {'pdf_storage_path': storage_path}})
+
+    # Attach to client documents as 'Handover checklist'
+    doc = ClientDocument(
+        client_id=client_id,
+        document_type='Handover checklist',
+        status='complete',
+        file_name=file_name,
+        source='staff-upload',
+        uploaded_by=user.id,
+        storage_path=storage_path,
+        content_type='application/pdf',
+        size_bytes=len(pdf_bytes),
+        notes='Digitally completed and signed Delivery Inspection & Handover Checklist',
+        signature_present=True
+    )
+
+    client_updates = {
+        'handover_checklist_status': 'Signed copy on file',
+        'pdi_complete': True,
+        'updated_at': now
+    }
+    
+    # Recalculate ready_for_delivery
+    merged_all = {**client, **client_updates}
+    payment_ok = bool(merged_all.get('payment_complete'))
+    has_trade_in = bool(merged_all.get('trade_in_flag') or merged_all.get('trade_in_attached'))
+    trade_in_ok = (not has_trade_in) or bool(merged_all.get('trade_in_docs_complete')) or (merged_all.get('trade_in_status') in ('Settled', 'Accepted', 'Vehicle received', 'Valid'))
+    pdi_ok = True
+    rego_ok = bool(merged_all.get('registration_docs_complete')) or (merged_all.get('registration_status') == 'Complete') or (merged_all.get('document_completeness') == 'Complete')
+    client_updates['ready_for_delivery'] = bool(payment_ok and trade_in_ok and pdi_ok and rego_ok)
+
+    await db.clients.update_one(
+        {'id': client_id},
+        {
+            '$push': {'documents': doc.model_dump(mode='json')},
+            '$set': client_updates
+        }
+    )
+    await _refresh_document_completeness(db, client_id)
+
+    return {
+        'success': True,
+        'inspection': DeliveryInspection(**_strip(inspection_doc)),
+        'file_name': file_name,
+        'storage_path': storage_path
+    }
+
+
+@router.get('/{client_id}/inspection/pdf')
+async def get_client_inspection_pdf(client_id: str, user: User = Depends(get_current_user)):
+    db = get_db()
+    client = await db.clients.find_one({'id': client_id})
+    if not client:
+        raise HTTPException(404, 'Client not found')
+    
+    inspection_doc = await db.inspections.find_one({'client_id': client_id})
+    data = _strip(inspection_doc) if inspection_doc else {}
+    pdf_bytes = generate_inspection_pdf(data, client)
+
+    return Response(
+        content=pdf_bytes,
+        media_type='application/pdf',
+        headers={'Content-Disposition': f'inline; filename="delivery-inspection-{client.get("rego") or client_id}.pdf"'}
+    )

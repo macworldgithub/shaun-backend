@@ -106,6 +106,10 @@ class ClientBase(BaseModel):
     vin: Optional[str] = None
     po_number: Optional[str] = None
     payment_method: Optional[str] = None  # Cash / Finance / Novated lease / Other
+    payment_complete: bool = False
+    trade_in_docs_complete: bool = False
+    pdi_complete: bool = False
+    ready_for_delivery: bool = False
     order_date: Optional[str] = None
     sale_type: SaleType = 'Retail'
     fleet_company: Optional[str] = None
@@ -188,6 +192,15 @@ class ClientBase(BaseModel):
                 pass
         if self.trade_in_valid_until and self.trade_in_valid_until < datetime.now(timezone.utc).date().isoformat() and self.trade_in_status in ('Pending', 'Valid', 'Expiring soon', 'Expiring'):
             self.trade_in_status = 'Expired'
+
+        # Operational Middle Layer: Ready For Delivery check
+        payment_ok = bool(self.payment_complete)
+        has_trade_in = bool(self.trade_in_flag or self.trade_in_attached)
+        trade_in_ok = (not has_trade_in) or bool(self.trade_in_docs_complete) or (self.trade_in_status in ('Settled', 'Accepted', 'Vehicle received', 'Valid'))
+        pdi_ok = bool(self.pdi_complete) or (self.stage in ('Ready for Pickup', 'Delivered'))
+        rego_ok = bool(self.registration_docs_complete) or (self.registration_status == 'Complete') or (self.document_completeness == 'Complete')
+        self.ready_for_delivery = bool(payment_ok and trade_in_ok and pdi_ok and rego_ok)
+
         return self
 
 
@@ -281,6 +294,10 @@ class ClientUpdate(BaseModel):
     vin: Optional[str] = None
     po_number: Optional[str] = None
     payment_method: Optional[str] = None
+    payment_complete: Optional[bool] = None
+    trade_in_docs_complete: Optional[bool] = None
+    pdi_complete: Optional[bool] = None
+    ready_for_delivery: Optional[bool] = None
     order_date: Optional[str] = None
     sale_type: Optional[SaleType] = None
     fleet_company: Optional[str] = None
@@ -487,5 +504,66 @@ class ShareAccessResponse(BaseModel):
     access_token: str
     label: str
     expires_at: Optional[datetime] = None
+
+
+# ===== DELIVERY INSPECTION =====
+class DeliveryInspection(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    id: str = Field(default_factory=_id)
+    client_id: str
+    order_no: Optional[str] = None
+    salesperson: Optional[str] = None
+    customer_name: Optional[str] = None
+    company_name: Optional[str] = None
+    address: Optional[str] = None
+    abn: Optional[str] = None
+    phone: Optional[str] = None
+    vehicle: Optional[str] = None
+    rego_stock: Optional[str] = None
+    vin: Optional[str] = None
+    dealership_name: str = 'HARMONY NEW ENERGY AUTO SERVICE (WSP) PTY LTD'
+    dealership_address: str = '415 Heidelberg Rd, Fairfield VIC 3078'
+    dealership_phone: str = '03 4110 8888'
+    dealership_email: str = 'fairfield@bydfairfield.com.au'
+    dealership_abn: str = '73 675 630 841'
+    dealership_lic: str = '0012833'
+    checklist: dict = Field(default_factory=dict)
+    fitted_accessories: List[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+    verification_declaration: str = 'I have inspected the vehicle and confirm it is in satisfactory condition, all accessories and keys have been received, and the vehicle features and controls have been explained to me.'
+    customer_signature: Optional[str] = None
+    customer_name_signed: Optional[str] = None
+    customer_signature_date: Optional[str] = None
+    salesperson_signature: Optional[str] = None
+    salesperson_name: Optional[str] = None
+    salesperson_signature_date: Optional[str] = None
+    signature_date: Optional[str] = None
+    specialist_name: Optional[str] = None
+    photos: dict = Field(default_factory=dict)  # front, drivers_side, rear, passenger_side, fuel_electricity, environment, boot_gift
+    status: Literal['draft', 'in_progress', 'completed'] = 'draft'
+    completed_at: Optional[datetime] = None
+    completed_by: Optional[str] = None
+    pdf_storage_path: Optional[str] = None
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+
+
+class DeliveryInspectionUpdate(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    checklist: Optional[dict] = None
+    fitted_accessories: Optional[List[str]] = None
+    notes: Optional[str] = None
+    verification_declaration: Optional[str] = None
+    customer_signature: Optional[str] = None
+    customer_name_signed: Optional[str] = None
+    customer_signature_date: Optional[str] = None
+    salesperson_signature: Optional[str] = None
+    salesperson_name: Optional[str] = None
+    salesperson_signature_date: Optional[str] = None
+    signature_date: Optional[str] = None
+    specialist_name: Optional[str] = None
+    photos: Optional[dict] = None
+    status: Optional[Literal['draft', 'in_progress', 'completed']] = None
+
 
 
