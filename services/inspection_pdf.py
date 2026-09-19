@@ -132,6 +132,14 @@ def generate_inspection_pdf(arg1: dict, arg2: dict) -> bytes:
         alignment=2,
         textColor=colors.HexColor('#008000')
     )
+    item_status_incomplete_style = ParagraphStyle(
+        'ItemStatusIncomplete',
+        fontName='Helvetica',
+        fontSize=8,
+        leading=11,
+        alignment=2,
+        textColor=colors.HexColor('#777777')
+    )
 
     decl_style = ParagraphStyle(
         'DeclarationStyle',
@@ -314,16 +322,66 @@ def generate_inspection_pdf(arg1: dict, arg2: dict) -> bytes:
     elements.append(Spacer(1, 10))
 
     # 4. Checklist row builder
-    def make_section_table(title: Optional[str], items: List[str]):
+    checklist = inspection_data.get('checklist') or {}
+
+    def is_item_complete(candidate_keys: List[str], label: str) -> bool:
+        if not checklist or not isinstance(checklist, dict):
+            return False
+        
+        # 1. Check if ANY candidate key is explicitly True
+        for k in candidate_keys:
+            if k in checklist:
+                val = checklist[k]
+                if val is True or val == 1 or str(val).lower() in ('true', '1', 'yes', 'complete'):
+                    return True
+
+        # 2. Check if ANY candidate key is explicitly False
+        for k in candidate_keys:
+            if k in checklist:
+                val = checklist[k]
+                if val is False or val == 0 or str(val).lower() in ('false', '0', 'no', 'incomplete'):
+                    return False
+
+        # 3. Check direct label
+        if label in checklist:
+            val = checklist[label]
+            if val is True or val == 1 or str(val).lower() in ('true', '1', 'yes', 'complete'):
+                return True
+            elif val is False or val == 0 or str(val).lower() in ('false', '0', 'no', 'incomplete'):
+                return False
+
+        # 4. Check normalized label key
+        norm_key = "".join(c if c.isalnum() else "_" for c in label.lower()).strip("_")
+        while "__" in norm_key:
+            norm_key = norm_key.replace("__", "_")
+        if norm_key in checklist:
+            val = checklist[norm_key]
+            if val is True or val == 1 or str(val).lower() in ('true', '1', 'yes', 'complete'):
+                return True
+
+        return False
+
+    def make_section_table(title: Optional[str], items: list):
         table_rows = []
         if title:
             table_rows.append([Paragraph(f"<b>{title}</b>", section_hdr_style), Paragraph("", item_status_style)])
-        for item_txt in items:
+        for item in items:
+            if isinstance(item, (list, tuple)):
+                item_txt = item[0]
+                candidate_keys = item[1] if len(item) > 1 else []
+            else:
+                item_txt = str(item)
+                candidate_keys = []
+
+            complete = is_item_complete(candidate_keys, item_txt)
+            status_txt = "Complete" if complete else "Incomplete"
+            status_style = item_status_style if complete else item_status_incomplete_style
+
             table_rows.append([
                 Paragraph(item_txt, item_lbl_style),
-                Paragraph("Complete", item_status_style)
+                Paragraph(status_txt, status_style)
             ])
-        t = Table(table_rows, colWidths=[page_width - 60, 60])
+        t = Table(table_rows, colWidths=[page_width - 70, 70])
         t.setStyle(TableStyle([
             ('VALIGN', (0,0), (-1,-1), 'TOP'),
             ('LEFTPADDING', (0,0), (-1,-1), 0),
@@ -335,46 +393,46 @@ def generate_inspection_pdf(arg1: dict, arg2: dict) -> bytes:
 
     # Page 1 Sections:
     elements.append(make_section_table("Prior to customer arrival", [
-        "Car is clean inside and out"
+        ("Car is clean inside and out", ["clean_inside_out", "car_washed_vacuumed_windows", "cleanliness_trim_condition"])
     ]))
     elements.append(Spacer(1, 4))
 
     elements.append(make_section_table("With Customer", [
-        "Welcome and congratulate customer on their new BYD",
-        "Introduce yourself as a BYD delivery specialist",
-        "Confirm all payments are made",
-        "Confirm the customer has comprehensive insurance"
+        ("Welcome and congratulate customer on their new BYD", ["welcome_congratulate", "walk_around_vehicle", "intro_dealership_service_team"]),
+        ("Introduce yourself as a BYD delivery specialist", ["introduce_specialist", "intro_dealership_service_team", "walk_around_vehicle"]),
+        ("Confirm all payments are made", ["confirm_payments", "payment_complete"]),
+        ("Confirm the customer has comprehensive insurance", ["confirm_insurance", "insurance_confirmed"])
     ]))
     elements.append(Spacer(1, 4))
 
     elements.append(make_section_table("Exterior", [
-        "Show customer how to access the car with keys, NFC card",
-        "Show customer how to access the boot and explain electronic close, lock and set height",
-        "Show customer included charging cable and how to use",
-        "Show customer included V2L cable and how to use",
-        "Show customer how to open bonnet and fill washer fluid"
+        ("Show customer how to access the car with keys, NFC card", ["access_keys_nfc", "nfc_card_setup_demo", "point_out_keys_emergency", "show_lock_unlock", "keys_and_emergency_key"]),
+        ("Show customer how to access the boot and explain electronic close, lock and set height", ["access_boot_power", "boot_operation_emergency"]),
+        ("Show customer included charging cable and how to use", ["charging_cable_usage", "charging_cable_demonstrated"]),
+        ("Show customer included V2L cable and how to use", ["v2l_cable_usage", "v2l_adaptor_handed_over"]),
+        ("Show customer how to open bonnet and fill washer fluid", ["bonnet_washer_fluid", "check_bodywork_condition"])
     ]))
     elements.append(Spacer(1, 4))
 
     elements.append(make_section_table("Interior", [
-        "Completely satisfied with the condition of interior",
-        "Explanation of infotainment/navigation system/ wireless charger",
-        "Explanation of safety features"
+        ("Completely satisfied with the condition of interior", ["condition_interior", "cleanliness_trim_condition", "floor_mats_seat_protection"]),
+        ("Explanation of infotainment/navigation system/ wireless charger", ["infotainment_navigation", "touchscreen_voice_control", "wireless_charging_usb_ports"]),
+        ("Explanation of safety features", ["safety_features", "driver_assistance_adas_acc"])
     ]))
     elements.append(Spacer(1, 4))
 
     elements.append(make_section_table("Seating", [
-        "Show customer rear seats and split fold",
-        "Show customer Isofix and tether points",
-        "Show customer how to adjust driver and front passenger seats",
-        "Show customer how to use sunroof and blind (if fitted)"
+        ("Show customer rear seats and split fold", ["rear_seats_split", "rear_seats_folding_headrests"]),
+        ("Show customer Isofix and tether points", ["isofix_tether", "seat_belts_child_anchors"]),
+        ("Show customer how to adjust driver and front passenger seats", ["seat_adjustment", "seat_adjustments_electric", "seat_heating_ventilation_memory"]),
+        ("Show customer how to use sunroof and blind (if fitted)", ["sunroof_blind", "sun_visors_vanity_lights"])
     ]))
     elements.append(Spacer(1, 4))
 
     elements.append(make_section_table("Technology", [
-        "Explain wireless phone charging and advise against storing NFC cards, credit cards etc. between phone and wireless charging pads while in use.",
-        "Pair Bluetooth and explain connection to Apple Car Play (USB cable) and Android Auto (wireless)",
-        "Explain OTA update procedure and how the 2GB data limit does not apply to this"
+        ("Explain wireless phone charging and advise against storing NFC cards, credit cards etc. between phone and wireless charging pads while in use.", ["wireless_charging_warning", "wireless_charging_usb_ports"]),
+        ("Pair Bluetooth and explain connection to Apple Car Play (USB cable) and Android Auto (wireless)", ["bluetooth_carplay_androidauto", "bluetooth_nav_radio_setup"]),
+        ("Explain OTA update procedure and how the 2GB data limit does not apply to this", ["ota_update_procedure", "software_updated_latest"])
     ]))
 
     # PAGE 2 BREAK
@@ -382,23 +440,23 @@ def generate_inspection_pdf(arg1: dict, arg2: dict) -> bytes:
 
     # Technology Part 2
     elements.append(make_section_table(None, [
-        "Explain that SIM card activation and BYD app registration will be activated in the next couple of days.",
-        "Explain \"Hi BYD\"",
-        "Explain Digital and FM radio, and other entertainment features",
-        "Explain vehicle controls (located on centre console, steering wheel etc.)",
-        "Explain how to select gears (including Neutral)",
-        "Explain automatic park brake engagement when in Park",
-        "Ask permission to download the BYD app for the customer to their phone",
-        "App features explained"
+        ("Explain that SIM card activation and BYD app registration will be activated in the next couple of days.", ["sim_app_registration", "byd_app_pairing_login"]),
+        ("Explain \"Hi BYD\"", ["hi_byd_voice", "touchscreen_voice_control"]),
+        ("Explain Digital and FM radio, and other entertainment features", ["digital_fm_radio", "bluetooth_nav_radio_setup"]),
+        ("Explain vehicle controls (located on centre console, steering wheel etc.)", ["vehicle_controls", "steering_controls_cluster"]),
+        ("Explain how to select gears (including Neutral)", ["gear_selection_neutral", "start_stop_gear_selector"]),
+        ("Explain automatic park brake engagement when in Park", ["park_brake_auto", "parking_brake_autohold"]),
+        ("Ask permission to download the BYD app for the customer to their phone", ["download_byd_app", "byd_app_pairing_login"]),
+        ("App features explained", ["app_features_explained", "byd_app_pairing_login"])
     ]))
     elements.append(Spacer(1, 6))
 
     elements.append(make_section_table("Driving", [
-        "Explain lane keeping features",
-        "Explain adaptive cruise control",
-        "Explain wipers, blinkers and distance to empty gauge",
-        "Explain 3 driving modes - Eco, Normal, Sport",
-        "Explain regenerative braking and settings"
+        ("Explain lane keeping features", ["lane_keeping", "driver_assistance_adas_acc"]),
+        ("Explain adaptive cruise control", ["adaptive_cruise", "driver_assistance_adas_acc"]),
+        ("Explain wipers, blinkers and distance to empty gauge", ["wipers_blinkers_distance", "steering_controls_cluster", "check_lights_wipers_mirrors"]),
+        ("Explain 3 driving modes - Eco, Normal, Sport", ["driving_modes", "drive_modes_regen_braking"]),
+        ("Explain regenerative braking and settings", ["regenerative_braking", "drive_modes_regen_braking"])
     ]))
     elements.append(Spacer(1, 6))
 
@@ -407,28 +465,38 @@ def generate_inspection_pdf(arg1: dict, arg2: dict) -> bytes:
         "Floor Mats Moulded (Deep Dish)", "Ceramic Window Tint (2x Front)"
     ]
     site_loc = client_data.get('site_location') or 'Fairfield'
-    acc_items = ["Explain use and care of any accessories fitted"] + fitted_accs + [f"Pickup from BYD {site_loc}"]
+    acc_items = [
+        ("Explain use and care of any accessories fitted", ["acc_care", "fitted_accessories_confirmed", "optional_extras_demonstrated"])
+    ]
+    for idx, acc in enumerate(fitted_accs):
+        acc_cand_keys = [f"acc_fitted_{idx}", acc, "fitted_accessories_confirmed"]
+        if "mat" in acc.lower():
+            acc_cand_keys.extend(["floor_mats_fitted", "floor_mats_seat_protection"])
+        if "tint" in acc.lower():
+            acc_cand_keys.append("tint_ppf_inspected")
+        acc_items.append((acc, acc_cand_keys))
+    acc_items.append((f"Pickup from BYD {site_loc}", ["pickup_site", "delivery_satisfaction_confirmed", "car_delivered"]))
     elements.append(make_section_table("Accessories", acc_items))
     elements.append(Spacer(1, 6))
 
     elements.append(make_section_table("Service and Support", [
-        "Show service sticker, and explain how to book online",
-        "Explain service intervals and details",
-        "Show customer how to view Owner's manual online"
+        ("Show service sticker, and explain how to book online", ["service_sticker_online", "service_intervals_booking_explained"]),
+        ("Explain service intervals and details", ["service_intervals", "service_intervals_booking_explained", "warranty_terms_coverage_explained"]),
+        ("Show customer how to view Owner's manual online", ["online_owners_manual", "manual_in_glovebox", "point_out_manual_roadside"])
     ]))
     elements.append(Spacer(1, 6))
 
     elements.append(make_section_table("Battery Health", [
-        "Discharging the vehicle to 10-20% State of Charge (SOC) at least once every three to six months, and then fully recharging to 100% using an AC charger.",
-        "AC charging is preferable over DC charging, and one single charge up to 100% SOC is preferred over multiple smaller charges.",
-        "If the vehicle is intended not to be used for 3 months or longer, keep the SOC between 40-60% to prevent the battery from over-discharging."
+        ("Discharging the vehicle to 10-20% State of Charge (SOC) at least once every three to six months, and then fully recharging to 100% using an AC charger.", ["soc_discharge_cycle", "soc_confirmed_at_delivery", "charging_instructions_best_practices"]),
+        ("AC charging is preferable over DC charging, and one single charge up to 100% SOC is preferred over multiple smaller charges.", ["ac_preferred_over_dc", "charging_instructions_best_practices"]),
+        ("If the vehicle is intended not to be used for 3 months or longer, keep the SOC between 40-60% to prevent the battery from over-discharging.", ["long_term_storage_soc", "home_public_charging_explained"])
     ]))
     elements.append(Spacer(1, 6))
 
     elements.append(make_section_table("Customer Experience", [
-        "Present gift in front of car and ask for permission to take photo of the customer and share on our platforms",
-        "Ask for customers signature to take delivery of the vehicle",
-        "Explain to the customer that they will receive a survey in their BYD app to share feedback in a month"
+        ("Present gift in front of car and ask for permission to take photo of the customer and share on our platforms", ["gift_presentation_photo", "photos_taken_celebration"]),
+        ("Ask for customers signature to take delivery of the vehicle", ["signature_taken", "delivery_satisfaction_confirmed", "customer_signature"]),
+        ("Explain to the customer that they will receive a survey in their BYD app to share feedback in a month", ["app_survey_feedback", "customer_queries_resolved", "delivery_satisfaction_confirmed"])
     ]))
 
     # PAGE 3 BREAK
