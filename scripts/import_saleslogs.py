@@ -65,6 +65,12 @@ def normalise_phone(raw):
     return digits
 
 
+def clean_identifier(value):
+    """Return a usable Saleslogs identity value, excluding export placeholders."""
+    clean = str(value or '').strip().replace('[REMOVED]', '')
+    return clean if clean and clean.upper() not in {'0', 'N/A', 'NA', 'NIL', 'NONE', 'NULL'} else None
+
+
 def to_iso_date(v):
     if not v:
         return None
@@ -241,7 +247,7 @@ def parse_csv_stream(stream):
     return list(reader)
 
 
-def import_records(rows, wipe_first=False):
+def import_records(rows, wipe_first=False, update_existing=False, dry_run=False):
     client = MongoClient(MONGO_URL)
     db = client[DB_NAME]
 
@@ -251,15 +257,69 @@ def import_records(rows, wipe_first=False):
 
     user_map = {u.get('name', '').lower(): u for u in db.users.find({'active': True})}
 
+    # Fetch possible duplicate records once.  Doing a database round-trip for
+    # every Saleslogs row makes a multi-department import unnecessarily slow.
+    order_numbers, vins, regos, emails, identityless_signatures = set(), set(), set(), set(), set()
+    for row in rows:
+        order_no = clean_identifier(row.get('OrderNo') or row.get('Order No.') or row.get('SaleslogsOrder'))
+        vin = clean_identifier(row.get('Vin') or row.get('Vin No.'))
+        rego = clean_identifier(row.get('Rego') or row.get('Rego No.'))
+        email = str(row.get('Email') or '').strip().lower()
+        if order_no:
+            order_numbers.add(order_no)
+        if vin:
+            vins.add(vin)
+        if rego:
+            regos.add(rego)
+        if email and email != 'nil':
+            emails.add(email)
+        if not any((order_no, vin, rego, email if email != 'nil' else None)):
+            name = title_case_name(row.get('DriverName') or row.get("Driver's Name") or row.get('Client') or row.get('CompanyName') or row.get('Company Name'))
+            phone = normalise_phone(row.get('PhoneNo') or row.get('Phone Number'))
+            vehicle = build_vehicle(row)
+            if name:
+                identityless_signatures.add((name, phone, vehicle))
+
+    duplicate_clauses = []
+    if order_numbers:
+        duplicate_clauses.append({'vy_order_id': {'$in': list(order_numbers)}})
+    if vins:
+        duplicate_clauses.append({'vin': {'$in': list(vins)}})
+    if regos:
+        duplicate_clauses.append({'rego': {'$in': list(regos)}})
+    if emails:
+        duplicate_clauses.append({'email': {'$in': list(emails)}})
+    if identityless_signatures:
+        duplicate_clauses.append({'$or': [
+            {'name': name, 'phone': phone, 'vehicle': vehicle}
+            for name, phone, vehicle in identityless_signatures
+        ]})
+
+    existing_by_order, existing_by_vin, existing_by_rego, existing_by_email_name, existing_by_signature = {}, {}, {}, {}, {}
+    if duplicate_clauses:
+        for existing in db.clients.find({'$or': duplicate_clauses}, {'id': 1, 'vy_order_id': 1, 'vin': 1, 'rego': 1, 'email': 1, 'name': 1, 'phone': 1, 'vehicle': 1}):
+            if existing.get('vy_order_id'):
+                existing_by_order[existing['vy_order_id']] = existing
+            if existing.get('vin'):
+                existing_by_vin[existing['vin']] = existing
+            if existing.get('rego'):
+                existing_by_rego[existing['rego']] = existing
+            if existing.get('email') and existing.get('name'):
+                existing_by_email_name[(existing['email'].lower(), existing['name'])] = existing
+            if existing.get('name'):
+                existing_by_signature[(existing['name'], existing.get('phone') or '', existing.get('vehicle') or '')] = existing
+
     counts = {
         'inserted': 0,
         'updated': 0,
+        'skipped_existing': 0,
         'skipped_cancelled': 0,
         'skipped_blank': 0,
         'by_stage': {},
         'arrived': 0,
         'unassigned': 0,
     }
+    pending_inserts = []
 
     for row in rows:
         name_raw = (row.get('DriverName') or row.get("Driver's Name") or 
@@ -273,9 +333,7 @@ def import_records(rows, wipe_first=False):
             counts[f'skipped_{skip}'] = counts.get(f'skipped_{skip}', 0) + 1
             continue
 
-        order_no = (str(row.get('OrderNo') or row.get('Order No.') or row.get('SaleslogsOrder') or '').strip()) or None
-        if order_no and '[REMOVED]' in order_no:
-            order_no = order_no.replace('[REMOVED]', '')
+        order_no = clean_identifier(row.get('OrderNo') or row.get('Order No.') or row.get('SaleslogsOrder'))
         phone = normalise_phone(row.get('PhoneNo') or row.get('Phone Number'))
         email = (str(row.get('Email') or '').strip().lower()) or None
         if email == '' or email == 'nil':
@@ -313,12 +371,8 @@ def import_records(rows, wipe_first=False):
         trade_in_flag = bool((row.get('TradeInType') or row.get('TradeInStockNo') or row.get('RegoTrade') or '').strip())
         trade_in_status = 'Pending' if trade_in_flag else 'Pending'
 
-        rego = (str(row.get('Rego') or row.get('Rego No.') or '').strip()) or None
-        if rego and '[REMOVED]' in rego:
-            rego = rego.replace('[REMOVED]', '')
-        vin = (str(row.get('Vin') or row.get('Vin No.') or '').strip()) or None
-        if vin and '[REMOVED]' in vin:
-            vin = vin.replace('[REMOVED]', '')
+        rego = clean_identifier(row.get('Rego') or row.get('Rego No.'))
+        vin = clean_identifier(row.get('Vin') or row.get('Vin No.'))
 
         stock_no = (str(row.get('StockNo') or row.get('Stock No.') or '').strip()) or None
         if stock_no and '[REMOVED]' in stock_no:
@@ -389,17 +443,42 @@ def import_records(rows, wipe_first=False):
         if email and name_raw:
             query.append({'email': email, 'name': client_doc['name']})
 
-        existing = None
-        if query:
-            existing = db.clients.find_one({'$or': query})
+        existing = (
+            (existing_by_order.get(order_no) if order_no else None)
+            or (existing_by_vin.get(vin) if vin else None)
+            or (existing_by_rego.get(rego) if rego else None)
+            or (existing_by_email_name.get((email, client_doc['name'])) if email else None)
+            or (existing_by_signature.get((client_doc['name'], client_doc['phone'], client_doc['vehicle']))
+                if not any((order_no, vin, rego, email)) else None)
+        )
 
         if existing:
-            client_doc['id'] = existing['id']
-            db.clients.update_one({'id': existing['id']}, {'$set': client_doc})
-            counts['updated'] += 1
+            if update_existing:
+                client_doc['id'] = existing['id']
+                if not dry_run:
+                    db.clients.update_one({'id': existing['id']}, {'$set': client_doc})
+                counts['updated'] += 1
+            else:
+                # Saleslogs snapshots are additive by default.  A matching
+                # client is left untouched so existing operational data is
+                # never overwritten by a later import.
+                counts['skipped_existing'] += 1
+                continue
         else:
             client_doc['id'] = uuid.uuid4().hex
-            db.clients.insert_one(client_doc)
+            if not dry_run:
+                pending_inserts.append(client_doc)
+            # Treat rows inserted earlier in this same file as existing too.
+            # This prevents duplicate client documents when departments overlap.
+            if order_no:
+                existing_by_order[order_no] = client_doc
+            if vin:
+                existing_by_vin[vin] = client_doc
+            if rego:
+                existing_by_rego[rego] = client_doc
+            if email:
+                existing_by_email_name[(email, client_doc['name'])] = client_doc
+            existing_by_signature[(client_doc['name'], client_doc['phone'], client_doc['vehicle'])] = client_doc
             counts['inserted'] += 1
 
         counts['by_stage'][stage] = counts['by_stage'].get(stage, 0) + 1
@@ -408,10 +487,17 @@ def import_records(rows, wipe_first=False):
         if not assigned_agent_id:
             counts['unassigned'] += 1
 
+    # Insert in batches so a multi-department snapshot does not perform
+    # thousands of individual network writes.
+    if pending_inserts:
+        for start in range(0, len(pending_inserts), 500):
+            db.clients.insert_many(pending_inserts[start:start + 500], ordered=True)
+
     print('\n=== Saleslogs Import Summary ===')
-    print(f"Total processed:    {counts['inserted'] + counts['updated']}")
+    print(f"Total processed:    {counts['inserted'] + counts['updated'] + counts['skipped_existing']}")
     print(f"Inserted:           {counts['inserted']}")
     print(f"Updated:            {counts['updated']}")
+    print(f"Skipped (existing): {counts['skipped_existing']}")
     print(f"Skipped (cancelled):{counts.get('skipped_cancelled', 0)}")
     print(f"Skipped (blank):    {counts.get('skipped_blank', 0)}")
     print('\nBreakdown by stage:')
@@ -419,30 +505,48 @@ def import_records(rows, wipe_first=False):
         print(f"  {s:30s} {n}")
     print(f"\nArrived at dealership:   {counts['arrived']}")
     print(f"Unassigned agent:        {counts['unassigned']}")
-    print(f"Total clients in DB now: {db.clients.count_documents({})}")
+    if dry_run:
+        print("Dry run only: no database changes were made.")
+    else:
+        print(f"Total clients in DB now: {db.clients.count_documents({})}")
+
+
+def rows_from_json(data):
+    """Return rows from a standard Saleslogs export or a combined department export."""
+    if isinstance(data, dict) and 'listCsv' in data:
+        return parse_csv_stream(io.StringIO(data['listCsv']))
+    if isinstance(data, dict) and isinstance(data.get('departments'), dict):
+        rows = []
+        for department in data['departments'].values():
+            export = department.get('data', {}) if isinstance(department, dict) else {}
+            list_csv = export.get('listCsv') if isinstance(export, dict) else None
+            if isinstance(list_csv, str) and list_csv.strip():
+                rows.extend(parse_csv_stream(io.StringIO(list_csv)))
+        return rows
+    if isinstance(data, list):
+        return data
+    raise ValueError('Unsupported JSON structure')
 
 
 def main():
-    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
-        file_path = sys.argv[1]
+    args = sys.argv[1:]
+    dry_run = '--dry-run' in args
+    update_existing = '--update-existing' in args
+    paths = [arg for arg in args if not arg.startswith('--')]
+    if paths and os.path.exists(paths[0]):
+        file_path = paths[0]
         print(f"Reading from file: {file_path}")
         if file_path.endswith('.json'):
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                if isinstance(data, dict) and 'listCsv' in data:
-                    rows = parse_csv_stream(io.StringIO(data['listCsv']))
-                elif isinstance(data, list):
-                    rows = data
-                else:
-                    print("Unsupported JSON structure")
-                    return
+                rows = rows_from_json(data)
         elif file_path.endswith('.csv'):
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 rows = parse_csv_stream(f)
         else:
             print("Unsupported file format. Please provide a .csv or .json file.")
             return
-        import_records(rows)
+        import_records(rows, update_existing=update_existing, dry_run=dry_run)
     else:
         # Check standard data path
         default_csv = Path(__file__).resolve().parents[1] / 'data' / 'saleslogs_import.csv'
@@ -450,18 +554,12 @@ def main():
         if default_csv.exists():
             with open(default_csv, 'r', encoding='utf-8', errors='replace') as f:
                 rows = parse_csv_stream(f)
-            import_records(rows)
+            import_records(rows, update_existing=update_existing, dry_run=dry_run)
         elif default_json.exists():
             with open(default_json, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                if isinstance(data, dict) and 'listCsv' in data:
-                    rows = parse_csv_stream(io.StringIO(data['listCsv']))
-                elif isinstance(data, list):
-                    rows = data
-                else:
-                    print("Unsupported JSON structure")
-                    return
-            import_records(rows)
+                rows = rows_from_json(data)
+            import_records(rows, update_existing=update_existing, dry_run=dry_run)
         else:
             print("No input file found. Please provide path to CSV/JSON or place in data/saleslogs_import.csv")
 
