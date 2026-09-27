@@ -22,6 +22,7 @@ from auth import get_current_user, require_admin
 from services.email import send_email
 from services.storage import put_bytes, get_bytes, exists
 from services.inspection_pdf import generate_inspection_pdf
+from services.crm_webhook import dispatch_crm_webhook
 
 router = APIRouter(prefix='/api/clients', tags=['clients'])
 
@@ -769,6 +770,20 @@ async def update_client(
     )
     if not res:
         raise HTTPException(404, 'Client not found')
+
+    # Emit Delivery Stage Changed Webhook to Sales CRM (§5.8, §8.3, AC-9)
+    if update.get('stage') and update['stage'] != existing.get('stage'):
+        dispatch_crm_webhook(
+            event='delivery.stage_changed',
+            client_id=client_id,
+            payload_data={
+                'new_stage': update['stage'],
+                'previous_stage': existing.get('stage'),
+                'delivery_date': update.get('delivery_date', existing.get('delivery_date')),
+            },
+            crm_customer_id=existing.get('crm_customer_id'),
+        )
+
     return Client(**_strip(res))
 
 
@@ -1218,6 +1233,20 @@ async def add_comment(
     )
     if res.matched_count == 0:
         raise HTTPException(404, 'Client not found')
+
+    # Emit Delivery Comment Added Webhook to Sales CRM (§5.2, §8.3, AC-3)
+    client_doc = await db.clients.find_one({'id': client_id}, {'crm_customer_id': 1})
+    dispatch_crm_webhook(
+        event='delivery.comment_added',
+        client_id=client_id,
+        payload_data={
+            'comment': payload.body,
+            'author': user.name,
+            'comment_id': comment.id,
+        },
+        crm_customer_id=client_doc.get('crm_customer_id') if client_doc else None,
+    )
+
     return comment
 
 
