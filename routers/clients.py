@@ -784,6 +784,19 @@ async def update_client(
             crm_customer_id=existing.get('crm_customer_id'),
         )
 
+    # Emit Delivery Exception/Alert Webhook to Sales CRM (§5.8, §8.3)
+    if update.get('alert') and update['alert'] != existing.get('alert'):
+        dispatch_crm_webhook(
+            event='delivery.exception_raised',
+            client_id=client_id,
+            payload_data={
+                'reason': update['alert'],
+                'exception_type': 'handover_alert',
+                'delivery_date': update.get('delivery_date', existing.get('delivery_date')),
+            },
+            crm_customer_id=existing.get('crm_customer_id'),
+        )
+
     return Client(**_strip(res))
 
 
