@@ -40,6 +40,23 @@ async def ensure_indexes():
     await db.offer_snapshots.create_index([('fetched_at', -1)])
     await db.share_views.create_index([('share_link_id', 1), ('viewed_at', -1)])
     await db.audit.create_index([('created_at', -1)])
+    # Contractor App indexes
+    await db.contractor_jobs.create_index('id', unique=True)
+    await db.contractor_jobs.create_index('client_id')
+    await db.contractor_jobs.create_index('assigned_contractor_id')
+    await db.contractor_jobs.create_index('status')
+    await db.contractor_jobs.create_index('full_vin')
+    await db.contractor_jobs.create_index('last_6_vin')
+    await db.contractor_jobs.create_index('is_urgent')
+    await db.contractor_jobs.create_index('due_date')
+    await db.contractor_jobs.create_index([('created_at', -1)])
+    await db.contractor_time_logs.create_index([('job_id', 1), ('contractor_id', 1)])
+    await db.contractor_time_logs.create_index([('contractor_id', 1), ('clock_out', 1)])
+    await db.contractor_evidence.create_index([('job_id', 1), ('captured_at', -1)])
+    await db.contractor_locations.create_index([('job_id', 1), ('recorded_at', -1)])
+    await db.contractor_job_templates.create_index('id', unique=True)
+    await db.contractor_activities.create_index([('job_id', 1), ('created_at', -1)])
+    await db.contractor_sync_logs.create_index([('synced_at', -1)])
 
 
 def close():

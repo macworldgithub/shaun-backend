@@ -77,6 +77,37 @@ async def run_due_notifications(now=None):
                                     day,
                                 )
 
+    # Contractor jobs due date and urgent check
+    async for job in db.contractor_jobs.find({'status': {'$nin': ['completed', 'invoiced']}}):
+        due = job.get('due_date')
+        if due:
+            job_days = _days_until(due, today)
+            if job_days in (2, 1, 0, -1):
+                key = f"contractor-job-{job.get('id')}-{job_days}"
+                msg = f"Contractor Job {job.get('model_name')} (VIN: {job.get('full_vin')}): due in {job_days} day(s). Contractor: {job.get('assigned_contractor_name') or 'Unassigned'}."
+                if not await _already_sent(db, key, day):
+                    recipient = os.environ.get('NOTIFICATION_EMAIL') or os.environ.get('SMTP_FROM')
+                    if recipient:
+                        try:
+                            await send_email(recipient=recipient, subject='BYD Contractor Job Due Alert', body=msg)
+                        except Exception:
+                            pass
+                    try:
+                        from services.push_service import notify_due_date_approaching
+                        await notify_due_date_approaching(db, job, job_days)
+                    except Exception as pe:
+                        log.warning("Could not dispatch due date push notification: %s", pe)
+                    await db.audit.insert_one({
+                        'id': f'notification-{key}-{day}',
+                        'actor_id': None,
+                        'actor_email': None,
+                        'action': 'notification.sent',
+                        'entity': 'contractor_job',
+                        'entity_id': job.get('id'),
+                        'meta': {'key': key, 'day': day, 'message': msg},
+                        'created_at': datetime.now(timezone.utc)
+                    })
+
 
 async def refresh_catalogue_on_first_of_month(now=None):
     now = now or datetime.now(MELBOURNE)
@@ -171,4 +202,5 @@ async def scheduled_workflow_worker():
             raise
         except Exception:
             log.exception('Scheduled workflow run failed')
-        await asyncio.sleep(3600)
+        # Spec §6: Fallback polling every 5–15 minutes (600s = 10 mins)
+        await asyncio.sleep(600)

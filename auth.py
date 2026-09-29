@@ -98,6 +98,8 @@ def require_role(*roles: str):
 
 require_admin = require_role('super_admin', 'admin')
 require_super = require_role('super_admin')
+require_contractor = require_role('contractor')
+require_contractor_or_admin = require_role('super_admin', 'admin', 'contractor')
 
 
 async def get_share_payload(

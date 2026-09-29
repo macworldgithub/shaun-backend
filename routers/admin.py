@@ -24,10 +24,19 @@ def _strip(d):
 
 # ----- Users -----
 @router.get('/users', response_model=List[User])
-async def list_users(_: User = Depends(require_admin)):
+async def list_users(
+    role: Optional[str] = None,
+    active_only: bool = False,
+    _: User = Depends(require_admin)
+):
     db = get_db()
+    query = {}
+    if role:
+        query['role'] = role
+    if active_only:
+        query['active'] = True
     out = []
-    async for d in db.users.find().sort('created_at', -1):
+    async for d in db.users.find(query).sort('created_at', -1):
         d.pop('password_hash', None)
         out.append(User(**_strip(d)))
     return out

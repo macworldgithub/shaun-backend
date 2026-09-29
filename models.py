@@ -13,7 +13,7 @@ def _id() -> str:
 
 
 # ===== USERS =====
-UserRole = Literal['super_admin', 'admin', 'agent']
+UserRole = Literal['super_admin', 'admin', 'agent', 'contractor']
 
 
 class User(BaseModel):
@@ -24,6 +24,9 @@ class User(BaseModel):
     role: UserRole = 'agent'
     team: Optional[str] = 'All Teams'
     active_site: Optional[str] = 'Fairfield'
+    company_name: Optional[str] = None
+    contractor_phone: Optional[str] = None
+    contractor_skills: List[str] = Field(default_factory=list)
     active: bool = True
     created_at: datetime = Field(default_factory=_now)
     last_login_at: Optional[datetime] = None
@@ -40,6 +43,9 @@ class UserCreate(BaseModel):
     role: UserRole = 'agent'
     team: Optional[str] = 'All Teams'
     active_site: Optional[str] = 'Fairfield'
+    company_name: Optional[str] = None
+    contractor_phone: Optional[str] = None
+    contractor_skills: List[str] = Field(default_factory=list)
     password: Optional[str] = None  # if None, server generates
 
 
@@ -48,6 +54,9 @@ class UserUpdate(BaseModel):
     role: Optional[UserRole] = None
     team: Optional[str] = None
     active_site: Optional[str] = None
+    company_name: Optional[str] = None
+    contractor_phone: Optional[str] = None
+    contractor_skills: Optional[List[str]] = None
     active: Optional[bool] = None
 
 
@@ -564,6 +573,24 @@ class DeliveryInspectionUpdate(BaseModel):
     specialist_name: Optional[str] = None
     photos: Optional[dict] = None
     status: Optional[Literal['draft', 'in_progress', 'completed']] = None
+
+
+# ===== CONTRACTOR JOB MANAGEMENT RE-EXPORTS =====
+from contractor_models import (
+    JobStatus, JobPriority, EvidenceStage, MediaType, ActivityType,
+    JobTask, JobTaskCreate, JobTaskUpdate,
+    JobBase, Job, JobCreate, JobUpdate, JobStatusUpdate, JobFlagIssue,
+    JobTemplate, JobTemplateCreate, JobTemplateUpdate, JobFromTemplateRequest,
+    JobTimeEntry, ClockInRequest, ClockOutRequest,
+    JobEvidence,
+    JobLocationEntry, LocationCheckInRequest,
+    JobActivity, JobCommentCreate,
+    IntegrationSyncLog, ConvertClientToJobRequest,
+    PushSubscriptionKeys, PushSubscriptionPayload, SendPushTestRequest,
+    BulkJobImportRequest, BulkJobImportResultItem, BulkJobImportResponse,
+    OfflineActionType, OfflineActionItem, OfflineActionResult,
+    OfflineBatchSyncRequest, OfflineBatchSyncResponse,
+)
 
 
 
