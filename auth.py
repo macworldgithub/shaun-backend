@@ -4,7 +4,7 @@ import jwt
 import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Literal
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from db import get_db
@@ -71,11 +71,13 @@ async def _load_user(user_id: str) -> Optional[UserInDB]:
 
 
 async def get_current_user(
+    request: Request,
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> User:
-    if not creds:
+    token_str = creds.credentials if creds else request.query_params.get('token')
+    if not token_str:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, 'Authentication required')
-    payload = decode_token(creds.credentials)
+    payload = decode_token(token_str)
     role = payload.get('role')
     if role and role.startswith('share:'):
         raise HTTPException(status.HTTP_403_FORBIDDEN, 'Share token cannot access this resource')
