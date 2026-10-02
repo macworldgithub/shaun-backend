@@ -7,6 +7,7 @@ import asyncio
 import io
 import csv
 import httpx
+import inspect
 
 from contractor_models import (
     Job, JobCreate, JobUpdate, JobTask, JobTaskCreate, JobStatus,
@@ -20,8 +21,14 @@ log = logging.getLogger('contractor_service')
 
 CONTRACTOR_WEBHOOK_URL = os.environ.get(
     'CONTRACTOR_WEBHOOK_URL',
-    os.environ.get('CONTRACTOR_APP_URL', 'http://localhost:5173') + '/api/webhooks/contractor'
+    os.environ.get('CONTRACTOR_APP_URL', 'https://byd-contractor-app.vercel.app') + '/api/webhooks/contractor'
 )
+
+
+async def _safe_call(coro_or_val):
+    if inspect.isawaitable(coro_or_val):
+        return await coro_or_val
+    return coro_or_val
 
 
 def _strip(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -93,13 +100,44 @@ async def sync_job_to_delivery_client(db, job_id: str, actor_name: str = 'System
     """
     Syncs contractor job status & completed tasks back into Delivery Centre Client.
     """
-    job_doc = await db.contractor_jobs.find_one({'id': job_id})
-    if not job_doc or not job_doc.get('client_id'):
+    job_doc = await _safe_call(db.contractor_jobs.find_one({'id': job_id}))
+    if not job_doc:
         return None
 
-    client_id = job_doc['client_id']
-    client = await db.clients.find_one({'id': client_id})
+    client_id = job_doc.get('client_id')
+    now = datetime.now(timezone.utc)
+
+    # If no client_id or missing, attempt lookup by VIN
+    client = None
+    if client_id and hasattr(db, 'clients'):
+        client = await _safe_call(db.clients.find_one({'id': client_id}))
+    if not client and hasattr(db, 'clients') and job_doc.get('full_vin'):
+        client = await _safe_call(db.clients.find_one({
+            '$or': [
+                {'vin': job_doc.get('full_vin')},
+                {'vin': {'$regex': job_doc.get('last_6_vin', ''), '$options': 'i'}}
+            ]
+        }))
+        if client:
+            client_id = client['id']
+            if hasattr(db, 'contractor_jobs'):
+                await _safe_call(db.contractor_jobs.update_one(
+                    {'id': job_id},
+                    {'$set': {'client_id': client_id, 'dc_job_id': client_id}}
+                ))
+
     if not client:
+        if hasattr(db, 'contractor_jobs'):
+            await _safe_call(db.contractor_jobs.update_one(
+                {'id': job_id},
+                {
+                    '$set': {
+                        'sync_status': 'failed',
+                        'sync_error': 'No matching Delivery Centre client found',
+                        'last_synced_at': now
+                    }
+                }
+            ))
         return None
 
     completed_tasks = [
@@ -123,7 +161,7 @@ async def sync_job_to_delivery_client(db, job_id: str, actor_name: str = 'System
                 accessories_changed = True
         updated_accessories.append(acc)
 
-    client_updates: Dict[str, Any] = {'updated_at': datetime.now(timezone.utc)}
+    client_updates: Dict[str, Any] = {'updated_at': now}
     if accessories_changed:
         client_updates['accessories'] = updated_accessories
 
@@ -143,20 +181,37 @@ async def sync_job_to_delivery_client(db, job_id: str, actor_name: str = 'System
             'author_id': 'system-contractor-sync',
             'author_name': f'Contractor App ({actor_name})',
             'body': comment_body,
-            'created_at': datetime.now(timezone.utc)
+            'created_at': now
         }
-        await db.clients.update_one(
-            {'id': client_id},
+        if hasattr(db, 'clients'):
+            await _safe_call(db.clients.update_one(
+                {'id': client_id},
+                {
+                    '$set': client_updates,
+                    '$push': {'comments': new_comment}
+                }
+            ))
+    elif accessories_changed or 'location' in client_updates:
+        if hasattr(db, 'clients'):
+            await _safe_call(db.clients.update_one(
+                {'id': client_id},
+                {'$set': client_updates}
+            ))
+
+    # Persist sync success state on contractor job
+    if hasattr(db, 'contractor_jobs'):
+        await _safe_call(db.contractor_jobs.update_one(
+            {'id': job_id},
             {
-                '$set': client_updates,
-                '$push': {'comments': new_comment}
+                '$set': {
+                    'sync_status': 'synced',
+                    'sync_error': None,
+                    'last_synced_at': now,
+                    'dc_job_id': client_id,
+                    'client_id': client_id
+                }
             }
-        )
-    elif accessories_changed:
-        await db.clients.update_one(
-            {'id': client_id},
-            {'$set': client_updates}
-        )
+        ))
 
     # Log sync event
     sync_log = IntegrationSyncLog(
@@ -169,9 +224,11 @@ async def sync_job_to_delivery_client(db, job_id: str, actor_name: str = 'System
             'job_status': job_status,
             'completed_tasks': completed_tasks,
             'accessories_updated': accessories_changed
-        }
+        },
+        synced_at=now
     )
-    await db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json'))
+    if hasattr(db, 'contractor_sync_logs'):
+        await _safe_call(db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json')))
     return sync_log
 
 
@@ -239,6 +296,9 @@ async def create_job_from_delivery_client(
         assigned_contractor_name=contractor_name,
         site_location=client.get('site_location') or 'Fairfield',
         checklist=checklist_items,
+        sync_status='synced',
+        dc_job_id=client_id,
+        last_synced_at=datetime.now(timezone.utc),
         created_by_id=created_by_user.id if created_by_user else 'system',
         created_by_name=created_by_user.name if created_by_user else 'Delivery Centre'
     )
@@ -269,6 +329,57 @@ async def create_job_from_delivery_client(
     dispatch_contractor_webhook('job.created', new_job.id, new_job.model_dump(mode='json'))
 
     return new_job
+
+
+async def sync_client_updates_to_contractor_jobs(
+    db,
+    client_id: str,
+    updates: dict,
+    actor_name: str = 'Delivery Centre'
+):
+    """
+    Inbound integration (Scope §6): When a client's due date, priority, VIN, rego, or notes change in Delivery Centre,
+    propagate those updates in real-time to any linked contractor job.
+    """
+    job_cursor = db.contractor_jobs.find({'client_id': client_id})
+    job_updates = {}
+    now = datetime.now(timezone.utc)
+
+    if 'delivery_date' in updates and updates['delivery_date']:
+        job_updates['delivery_date_time'] = updates['delivery_date']
+        job_updates['due_date'] = updates['delivery_date']
+    if 'vin' in updates and updates['vin']:
+        clean_vin = updates['vin'].strip().upper()
+        job_updates['full_vin'] = clean_vin
+        job_updates['last_6_vin'] = clean_vin[-6:] if len(clean_vin) >= 6 else clean_vin
+    if 'rego' in updates and updates['rego']:
+        job_updates['rego'] = updates['rego']
+    if 'vehicle' in updates and updates['vehicle']:
+        job_updates['model_name'] = updates['vehicle']
+    if 'alert' in updates and updates['alert']:
+        job_updates['priority'] = 'urgent'
+        job_updates['is_urgent'] = True
+
+    if not job_updates:
+        return
+
+    job_updates['updated_at'] = now
+    job_updates['sync_status'] = 'synced'
+    job_updates['last_synced_at'] = now
+
+    async for job in job_cursor:
+        await db.contractor_jobs.update_one({'id': job['id']}, {'$set': job_updates})
+        await log_job_activity(
+            db=db,
+            job_id=job['id'],
+            activity_type='integration_sync',
+            author_id='system',
+            author_name=f'Delivery Centre ({actor_name})',
+            message=f"Real-time update from Delivery Centre: {', '.join(job_updates.keys())}",
+            meta=job_updates,
+            created_at=now
+        )
+        dispatch_contractor_webhook('job.updated', job['id'], {**job, **job_updates})
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +522,9 @@ async def clock_out_contractor(
         created_at=now
     )
 
+    # Sync updated time tracking data to delivery centre client
+    await sync_job_to_delivery_client(db, job_id, contractor_name)
+
     updated_entry = await db.contractor_time_logs.find_one({'id': active_entry['id']})
     return JobTimeEntry(**_strip(updated_entry))
 
@@ -491,9 +605,17 @@ async def compute_contractor_analytics(
     if date_from or date_to:
         created_range = {}
         if date_from:
-            created_range['$gte'] = datetime.fromisoformat(date_from)
+            dt_from = datetime.fromisoformat(date_from)
+            if dt_from.tzinfo is None:
+                dt_from = dt_from.replace(tzinfo=timezone.utc)
+            created_range['$gte'] = dt_from
         if date_to:
-            created_range['$lte'] = datetime.fromisoformat(date_to)
+            dt_to = datetime.fromisoformat(date_to)
+            if len(date_to) <= 10:
+                dt_to = dt_to.replace(hour=23, minute=59, second=59, microsecond=999999)
+            if dt_to.tzinfo is None:
+                dt_to = dt_to.replace(tzinfo=timezone.utc)
+            created_range['$lte'] = dt_to
         query['created_at'] = created_range
 
     total_jobs = await db.contractor_jobs.count_documents(query)

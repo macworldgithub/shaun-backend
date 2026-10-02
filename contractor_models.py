@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
 from typing import List, Optional, Literal
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator, computed_field
 import uuid
+from typing import Dict, Any
 
 
 def _now() -> datetime:
@@ -47,6 +48,11 @@ class JobTask(BaseModel):
     completed_by_name: Optional[str] = None
     notes: Optional[str] = None
 
+    @computed_field
+    @property
+    def label(self) -> str:
+        return self.title
+
 
 class JobTaskCreate(BaseModel):
     title: str
@@ -84,6 +90,10 @@ class JobBase(BaseModel):
     issue_reported_by_name: Optional[str] = None
     issue_reported_at: Optional[datetime] = None
     total_time_seconds: int = 0
+    sync_status: Optional[str] = 'pending'
+    sync_error: Optional[str] = None
+    last_synced_at: Optional[datetime] = None
+    dc_job_id: Optional[str] = None
 
     @model_validator(mode='after')
     def compute_last_6_vin(self):
@@ -97,7 +107,53 @@ class JobBase(BaseModel):
             self.is_urgent = True
         elif self.is_urgent:
             self.priority = 'urgent'
+        if self.client_id and not self.dc_job_id:
+            self.dc_job_id = self.client_id
+        elif self.dc_job_id and not self.client_id:
+            self.client_id = self.dc_job_id
         return self
+
+    @computed_field
+    @property
+    def total_time_minutes(self) -> float:
+        return round(self.total_time_seconds / 60.0, 1)
+
+    @computed_field
+    @property
+    def current_location_name(self) -> str:
+        if self.bay_location:
+            return f"{self.site_location or 'Fairfield'} - {self.bay_location}"
+        return self.site_location or 'BYD Fairfield'
+
+    @computed_field
+    @property
+    def tasks(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                'id': t.id,
+                'title': t.title,
+                'label': t.title,
+                'completed': t.completed,
+                'completed_at': t.completed_at.isoformat() if t.completed_at else None,
+                'completed_by_id': t.completed_by_id,
+                'completed_by_name': t.completed_by_name,
+                'notes': t.notes
+            }
+            for t in self.checklist
+        ]
+
+    @computed_field
+    @property
+    def flagged_issues(self) -> List[Dict[str, Any]]:
+        if self.issue_flag:
+            return [{
+                'issue_type': 'Urgent Blocker' if self.is_urgent else 'Reported Issue',
+                'notes': self.issue_description or 'Issue flagged by contractor',
+                'status': 'open',
+                'reported_by': self.issue_reported_by_name,
+                'reported_at': self.issue_reported_at.isoformat() if self.issue_reported_at else None
+            }]
+        return []
 
 
 class Job(JobBase):
@@ -149,6 +205,10 @@ class JobUpdate(BaseModel):
     assigned_contractor_name: Optional[str] = None
     site_location: Optional[str] = None
     bay_location: Optional[str] = None
+    sync_status: Optional[str] = None
+    sync_error: Optional[str] = None
+    last_synced_at: Optional[datetime] = None
+    dc_job_id: Optional[str] = None
 
 
 class JobStatusUpdate(BaseModel):

@@ -317,6 +317,7 @@ async def test_sync_completed_job_to_delivery_client():
     }
 
     mock_db.contractor_jobs.find_one = AsyncMock(return_value=mock_job)
+    mock_db.contractor_jobs.update_one = AsyncMock()
     mock_db.clients.find_one = AsyncMock(return_value=mock_client)
     mock_db.clients.update_one = AsyncMock()
     mock_db.contractor_sync_logs.insert_one = AsyncMock()
@@ -576,6 +577,9 @@ async def test_process_offline_batch_sync():
     mock_db.contractor_locations.insert_one = AsyncMock(return_value=MagicMock())
     mock_db.contractor_sync_logs = MagicMock()
     mock_db.contractor_sync_logs.insert_one = AsyncMock(return_value=MagicMock())
+    mock_db.clients = MagicMock()
+    mock_db.clients.find_one = AsyncMock(return_value=None)
+    mock_db.clients.update_one = AsyncMock(return_value=MagicMock())
 
     user = User(id='contractor-1', email='con@byd.com', name='Con', role='contractor')
 

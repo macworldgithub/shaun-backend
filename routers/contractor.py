@@ -81,6 +81,7 @@ async def list_jobs(
     is_urgent: Optional[bool] = None,
     model: Optional[str] = None,
     vin: Optional[str] = None,
+    client_id: Optional[str] = None,
     contractor_id: Optional[str] = None,
     site: Optional[str] = None,
     limit: int = Query(200, le=1000),
@@ -113,6 +114,13 @@ async def list_jobs(
             {'full_vin': {'$regex': vin, '$options': 'i'}},
             {'last_6_vin': {'$regex': vin, '$options': 'i'}}
         ]
+    if client_id:
+        client_or = [{'client_id': client_id}, {'dc_job_id': client_id}]
+        if '$or' in query:
+            vin_or = query.pop('$or')
+            query['$and'] = [{'$or': vin_or}, {'$or': client_or}]
+        else:
+            query['$or'] = client_or
     if site:
         query['site_location'] = site
 

@@ -23,6 +23,7 @@ from services.email import send_email
 from services.storage import put_bytes, get_bytes, exists
 from services.inspection_pdf import generate_inspection_pdf
 from services.crm_webhook import dispatch_crm_webhook
+from services.contractor_service import sync_client_updates_to_contractor_jobs
 
 router = APIRouter(prefix='/api/clients', tags=['clients'])
 
@@ -796,6 +797,17 @@ async def update_client(
             },
             crm_customer_id=existing.get('crm_customer_id'),
         )
+
+    # Inbound Contractor App Sync (Scope §6: Real-time sync of due dates, vehicle, priority, notes)
+    try:
+        await sync_client_updates_to_contractor_jobs(
+            db=db,
+            client_id=client_id,
+            updates=update,
+            actor_name=user.name if user else 'Delivery Centre'
+        )
+    except Exception as exc:
+        pass
 
     return Client(**_strip(res))
 
