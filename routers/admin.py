@@ -3,6 +3,7 @@ from typing import Optional, List
 from datetime import datetime, timezone, timedelta
 import asyncio
 import uuid
+import re
 
 from db import get_db
 from models import (
@@ -123,44 +124,57 @@ async def audit_log(_: User = Depends(require_admin), limit: int = Query(200, le
 
 # ----- Stats -----
 @router.get('/stats')
-async def stats(_: User = Depends(get_current_user)):
+async def stats(
+    site_location: Optional[str] = None,
+    _: User = Depends(get_current_user)
+):
     db = get_db()
     today_dt = datetime.now(timezone.utc).date()
     today_iso = today_dt.isoformat()
     tomorrow_iso = (today_dt + timedelta(days=1)).isoformat()
     plus_one_iso = (today_dt + timedelta(days=2)).isoformat()
 
-    total = await db.clients.count_documents({})
+    base_q = {}
+    if site_location and site_location.strip().lower() not in ('all', 'all sites'):
+        base_q['site_location'] = {'$regex': f'^{re.escape(site_location.strip())}$', '$options': 'i'}
+
+    total = await db.clients.count_documents(base_q)
     by_stage = {}
-    pipeline = [{'$group': {'_id': '$stage', 'count': {'$sum': 1}}}]
+    pipeline = []
+    if base_q:
+        pipeline.append({'$match': base_q})
+    pipeline.append({'$group': {'_id': '$stage', 'count': {'$sum': 1}}})
     async for d in db.clients.aggregate(pipeline):
         by_stage[d['_id'] or 'Unknown'] = d['count']
 
     # Pipeline counts
-    today_bookings = await db.clients.count_documents({'delivery_date': today_iso})
-    today_completed = await db.clients.count_documents({'delivery_date': today_iso, 'stage': 'Delivered'})
-    tomorrow_bookings = await db.clients.count_documents({'delivery_date': tomorrow_iso})
-    plus_one_bookings = await db.clients.count_documents({'delivery_date': plus_one_iso})
+    today_bookings = await db.clients.count_documents({**base_q, 'delivery_date': today_iso})
+    today_completed = await db.clients.count_documents({**base_q, 'delivery_date': today_iso, 'stage': 'Delivered'})
+    tomorrow_bookings = await db.clients.count_documents({**base_q, 'delivery_date': tomorrow_iso})
+    plus_one_bookings = await db.clients.count_documents({**base_q, 'delivery_date': plus_one_iso})
 
     arrived_pending = await db.clients.count_documents({
+        **base_q,
         'arrived': True,
         'stage': {'$nin': ['Delivered']},
     })
-    not_contacted = await db.clients.count_documents({'contact_status': 'Not Contacted'})
-    unassigned = await db.clients.count_documents({'$or': [{'assigned_agent_id': None}, {'assigned_agent_id': ''}]})
-    docs_outstanding = await db.clients.count_documents({'document_completeness': {'$in': ['Requested', 'Partial']}})
-    offers_at_risk = await db.clients.count_documents({'offer_status': {'$in': ['At risk', 'Ineligible']}})
-    trade_ins_at_risk = await db.clients.count_documents({'trade_in_status': {'$in': ['Expiring', 'Expired', 'At risk']}})
-    ready_to_register = await db.clients.count_documents({'registration_status': 'Ready to register'})
-    ready_to_handover = await db.clients.count_documents({'handover_checklist_status': 'Signed copy on file', 'activation_ready': False})
-    ready_for_delivery = await db.clients.count_documents({'ready_for_delivery': True, 'stage': {'$ne': 'Delivered'}})
+    not_contacted = await db.clients.count_documents({**base_q, 'contact_status': 'Not Contacted'})
+    unassigned = await db.clients.count_documents({**base_q, '$or': [{'assigned_agent_id': None}, {'assigned_agent_id': ''}]})
+    docs_outstanding = await db.clients.count_documents({**base_q, 'document_completeness': {'$in': ['Requested', 'Partial']}})
+    offers_at_risk = await db.clients.count_documents({**base_q, 'offer_status': {'$in': ['At risk', 'Ineligible']}})
+    trade_ins_at_risk = await db.clients.count_documents({**base_q, 'trade_in_status': {'$in': ['Expiring', 'Expired', 'At risk']}})
+    ready_to_register = await db.clients.count_documents({**base_q, 'registration_status': 'Ready to register'})
+    ready_to_handover = await db.clients.count_documents({**base_q, 'handover_checklist_status': 'Signed copy on file', 'activation_ready': False})
+    ready_for_delivery = await db.clients.count_documents({**base_q, 'ready_for_delivery': True, 'stage': {'$ne': 'Delivered'}})
 
     # Leak prevention exceptions
     unallocated_stock = await db.clients.count_documents({
+        **base_q,
         '$or': [{'vin': None}, {'vin': ''}, {'rego': None}, {'rego': ''}],
         'stage': {'$ne': 'Delivered'}
     })
     overdue_updates = await db.clients.count_documents({
+        **base_q,
         'delivery_date': {'$lt': today_iso},
         'stage': {'$ne': 'Delivered'}
     })

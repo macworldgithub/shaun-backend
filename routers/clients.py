@@ -224,6 +224,8 @@ async def list_clients(
     unassigned: Optional[bool] = None,
     mine: Optional[bool] = None,
     search: Optional[str] = None,
+    site_location: Optional[str] = None,
+    limit: Optional[int] = 5000,
 ):
     db = get_db()
     q: dict = {}
@@ -239,13 +241,19 @@ async def list_clients(
         q['assigned_agent_id'] = user.id
     elif assigned_agent_id:
         q['assigned_agent_id'] = assigned_agent_id
+    if site_location and site_location.strip().lower() not in ('all', 'all sites'):
+        clean_site = site_location.strip()
+        escaped = re.escape(clean_site)
+        q['site_location'] = {'$regex': f'^{escaped}$', '$options': 'i'}
     if search:
         regex = {'$regex': search, '$options': 'i'}
         q['$or'] = (q.get('$or', [])) + [
             {'name': regex}, {'phone': regex}, {'vehicle': regex},
             {'rego': regex}, {'vy_order_id': regex}, {'email': regex},
         ]
-    cursor = db.clients.find(q).sort([('delivery_date', 1), ('created_at', -1)]).limit(500)
+    cursor = db.clients.find(q).sort([('delivery_date', 1), ('created_at', -1)])
+    if limit:
+        cursor = cursor.limit(limit)
     rows = []
     async for doc in cursor:
         rows.append(Client(**_strip(doc)))
