@@ -1,5 +1,8 @@
 .env
 venv
+__pycache__/
+*.pyc
 services/__pycache__
 tests/__pycache__
 routers/__pycache__
+

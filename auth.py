@@ -104,6 +104,23 @@ require_contractor = require_role('contractor')
 require_contractor_or_admin = require_role('super_admin', 'admin', 'contractor')
 
 
+def effective_site(user: User, requested: Optional[str] = None) -> Optional[str]:
+    """Site-locked users are always pinned to their locked_site, whatever was requested."""
+    locked = getattr(user, 'locked_site', None)
+    if locked:
+        return locked
+    return requested
+
+
+def assert_site_access(user: User, doc: Optional[dict]) -> None:
+    """Raise 404 when a site-locked user touches a record from another site."""
+    locked = getattr(user, 'locked_site', None)
+    if not locked or not doc:
+        return
+    if (doc.get('site_location') or '').strip().lower() != locked.strip().lower():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, 'Client not found')
+
+
 async def get_share_payload(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> dict:

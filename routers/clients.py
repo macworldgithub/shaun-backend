@@ -18,7 +18,7 @@ from models import (
     ClientDocument, ClientDocumentUpdate, DocumentType, OfferRecord, OfferCreate, OfferUpdate,
     DeliveryInspection, DeliveryInspectionUpdate,
 )
-from auth import get_current_user, require_admin
+from auth import get_current_user, require_admin, effective_site, assert_site_access
 from services.email import send_email
 from services.storage import put_bytes, get_bytes, exists
 from services.inspection_pdf import generate_inspection_pdf
@@ -241,6 +241,7 @@ async def list_clients(
         q['assigned_agent_id'] = user.id
     elif assigned_agent_id:
         q['assigned_agent_id'] = assigned_agent_id
+    site_location = effective_site(user, site_location)
     if site_location and site_location.strip().lower() not in ('all', 'all sites'):
         clean_site = site_location.strip()
         escaped = re.escape(clean_site)
@@ -275,6 +276,8 @@ async def create_client(payload: ClientBase, user: User = Depends(get_current_us
         if existing:
             raise HTTPException(409, 'Client with this VY order ID already exists')
     client = Client(**payload.model_dump())
+    if getattr(user, 'locked_site', None):
+        client.site_location = user.locked_site
     await db.clients.insert_one(client.model_dump(mode='json'))
     return client
 
@@ -288,7 +291,11 @@ async def client_alerts(user: User = Depends(get_current_user)):
     db = get_db()
     today = datetime.now(timezone.utc).date()
     alerts = []
-    async for client in db.clients.find({'stage': {'$ne': 'Delivered'}}).limit(500):
+    alert_q: dict = {'stage': {'$ne': 'Delivered'}}
+    locked = effective_site(user)
+    if locked:
+        alert_q['site_location'] = {'$regex': f'^{re.escape(locked.strip())}$', '$options': 'i'}
+    async for client in db.clients.find(alert_q).limit(500):
         client_id = client.get('id')
         name = client.get('name', 'Client')
         valid_until = client.get('trade_in_valid_until')
@@ -690,6 +697,7 @@ async def get_client(client_id: str, user: User = Depends(get_current_user)):
     doc = await db.clients.find_one({'id': client_id})
     if not doc:
         raise HTTPException(404, 'Client not found')
+    assert_site_access(user, doc)
     return Client(**_strip(doc))
 
 

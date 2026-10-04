@@ -52,13 +52,13 @@ async def test_api_site_filtering():
     assert all(c.site_location == 'Denza Melbourne' for c in dm_clients)
 
     # 4. Stats filtering
-    cs_stats = await stats(site_location='BYD Caroline Springs', _=admin)
+    cs_stats = await stats(site_location='BYD Caroline Springs', user=admin)
     assert cs_stats['total_clients'] == 2258
 
-    nw_stats = await stats(site_location='BYD Nunawading', _=admin)
+    nw_stats = await stats(site_location='BYD Nunawading', user=admin)
     assert nw_stats['total_clients'] == 290
 
-    dm_stats = await stats(site_location='Denza Melbourne', _=admin)
+    dm_stats = await stats(site_location='Denza Melbourne', user=admin)
     assert dm_stats['total_clients'] == 921
     
     db_module.close()

@@ -10,7 +10,7 @@ from models import (
     User, UserInDB, UserCreate, UserUpdate, AuditEvent,
 )
 from auth import (
-    get_current_user, require_admin, require_super,
+    get_current_user, require_admin, require_super, effective_site,
     hash_password, generate_password,
 )
 from services.harmony_import import import_harmony_from_bytes
@@ -56,6 +56,8 @@ async def create_user(payload: UserCreate, request: Request, admin: User = Depen
         email=email,
         name=payload.name,
         role=payload.role,
+        active_site=payload.active_site,
+        locked_site=payload.locked_site,
         password_hash=hash_password(pw),
         must_change_password=payload.password is None,
     )
@@ -126,8 +128,9 @@ async def audit_log(_: User = Depends(require_admin), limit: int = Query(200, le
 @router.get('/stats')
 async def stats(
     site_location: Optional[str] = None,
-    _: User = Depends(get_current_user)
+    user: User = Depends(get_current_user)
 ):
+    site_location = effective_site(user, site_location)
     db = get_db()
     today_dt = datetime.now(timezone.utc).date()
     today_iso = today_dt.isoformat()

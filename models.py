@@ -24,6 +24,8 @@ class User(BaseModel):
     role: UserRole = 'agent'
     team: Optional[str] = 'All Teams'
     active_site: Optional[str] = 'Fairfield'
+    # When set, the user can only see/act on data from this site (server-enforced)
+    locked_site: Optional[str] = None
     company_name: Optional[str] = None
     contractor_phone: Optional[str] = None
     contractor_skills: List[str] = Field(default_factory=list)
@@ -43,6 +45,7 @@ class UserCreate(BaseModel):
     role: UserRole = 'agent'
     team: Optional[str] = 'All Teams'
     active_site: Optional[str] = 'Fairfield'
+    locked_site: Optional[str] = None
     company_name: Optional[str] = None
     contractor_phone: Optional[str] = None
     contractor_skills: List[str] = Field(default_factory=list)
@@ -54,6 +57,7 @@ class UserUpdate(BaseModel):
     role: Optional[UserRole] = None
     team: Optional[str] = None
     active_site: Optional[str] = None
+    locked_site: Optional[str] = None
     company_name: Optional[str] = None
     contractor_phone: Optional[str] = None
     contractor_skills: Optional[List[str]] = None
