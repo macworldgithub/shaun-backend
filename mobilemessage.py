@@ -13,6 +13,11 @@ import os
 import asyncio
 import logging
 from typing import Optional
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure .env is loaded if imported standalone
+load_dotenv(Path(__file__).resolve().parent / '.env')
 
 import requests
 
@@ -20,8 +25,10 @@ log = logging.getLogger('mobilemessage')
 
 MOBILEMESSAGE_USERNAME = os.environ.get('MOBILEMESSAGE_USERNAME')
 MOBILEMESSAGE_PASSWORD = os.environ.get('MOBILEMESSAGE_PASSWORD')
-MOBILEMESSAGE_FROM = os.environ.get('MOBILEMESSAGE_FROM', 'BYDMELB')
-MOBILEMESSAGE_URL = 'https://api.mobilemessage.com.au/v1/messages'
+MOBILEMESSAGE_FROM = os.environ.get('MOBILEMESSAGE_FROM', '+61468104118')
+MOBILEMESSAGE_URL = os.environ.get('MOBILEMESSAGE_API_URL', 'https://api.mobilemessage.com.au/v1/messages')
+if not MOBILEMESSAGE_URL.endswith('/v1/messages'):
+    MOBILEMESSAGE_URL = MOBILEMESSAGE_URL.rstrip('/') + '/v1/messages'
 
 
 def normalise_au(phone: str) -> str:
@@ -39,7 +46,12 @@ def normalise_au(phone: str) -> str:
 
 
 def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
-    if not MOBILEMESSAGE_USERNAME or not MOBILEMESSAGE_PASSWORD:
+    username = os.environ.get('MOBILEMESSAGE_USERNAME') or MOBILEMESSAGE_USERNAME
+    password = os.environ.get('MOBILEMESSAGE_PASSWORD') or MOBILEMESSAGE_PASSWORD
+    from_sender = os.environ.get('MOBILEMESSAGE_FROM') or MOBILEMESSAGE_FROM or '+61468104118'
+    url = MOBILEMESSAGE_URL
+
+    if not username or not password:
         log.warning('MobileMessage credentials missing; SMS not sent')
         return {'success': False, 'status': 'unconfigured', 'error': 'SMS provider not configured'}
 
@@ -48,14 +60,14 @@ def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
         'messages': [{
             'to': to_norm,
             'message': body[:1530],
-            'sender': MOBILEMESSAGE_FROM,
+            'sender': from_sender,
             **({'custom_ref': custom_ref} if custom_ref else {}),
         }]
     }
     try:
         r = requests.post(
-            MOBILEMESSAGE_URL,
-            auth=(MOBILEMESSAGE_USERNAME, MOBILEMESSAGE_PASSWORD),
+            url,
+            auth=(username, password),
             json=payload,
             timeout=20,
         )
