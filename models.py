@@ -12,8 +12,10 @@ def _id() -> str:
     return str(uuid.uuid4())
 
 
-# ===== USERS =====
-UserRole = Literal['super_admin', 'admin', 'agent', 'contractor']
+UserRole = Literal[
+    'super_admin', 'admin', 'agent', 'contractor',
+    'manager', 'sales_manager', 'sales_consultant', 'consultant', 'bdc', 'delivery'
+]
 
 
 class User(BaseModel):
