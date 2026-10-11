@@ -12,6 +12,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Fix SRV lookup over local router DNS
+import dns.resolver
+dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
+dns.resolver.default_resolver.nameservers = ['8.8.8.8', '8.8.4.4']
+
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -38,7 +43,6 @@ DB_NAME = os.environ.get('DB_NAME', 'test_database')
 DEPARTMENT_SITE_MAP = {
     'BYD Caroline Springs - New': 'BYD Caroline Springs',
     'BYD Nunawading - New': 'BYD Nunawading',
-    'Denza Melbourne - New': 'Denza Melbourne',
 }
 
 
@@ -70,11 +74,17 @@ def run_import(dry_run=False, backfill_existing_sites=True):
 
     existing_docs = list(db.clients.find({}, {
         'id': 1, 'vy_order_id': 1, 'vin': 1, 'rego': 1,
-        'email': 1, 'name': 1, 'phone': 1, 'vehicle': 1, 'site_location': 1
+        'email': 1, 'name': 1, 'phone': 1, 'vehicle': 1, 'site_location': 1,
+        'stage': 1, 'arrived': 1, 'delivery_date': 1, 'salesperson': 1,
+        'delivery_consultant': 1, 'vy_stock_id': 1, 'trade_in_flag': 1
     }))
     print(f"Loaded {len(existing_docs)} existing client documents from database.")
 
     for doc in existing_docs:
+        # Strictly ignore Denza Melbourne records - do not modify or match against them
+        if doc.get('site_location') == 'Denza Melbourne':
+            continue
+
         doc_id = doc.get('id')
         order = doc.get('vy_order_id')
         vin = doc.get('vin')
@@ -102,7 +112,7 @@ def run_import(dry_run=False, backfill_existing_sites=True):
         'skipped_cancelled': 0,
         'matched_existing': 0,
         'new_to_insert': 0,
-        'existing_sites_updated': 0,
+        'existing_updated': 0,
         'by_site_new': {},
         'by_site_existing': {},
         'by_stage_new': {},
@@ -118,6 +128,14 @@ def run_import(dry_run=False, backfill_existing_sites=True):
     seen_regos = set(existing_regos.keys())
     seen_email_names = set(existing_email_names.keys())
     seen_signatures = set(existing_signatures.keys())
+
+    STAGE_RANK = {
+        'Scheduled': 1,
+        'In Transit': 2,
+        'Pre-Delivery Inspection': 3,
+        'Ready for Pickup': 4,
+        'Delivered': 5
+    }
 
     for dept_key, mapped_site in DEPARTMENT_SITE_MAP.items():
         dept_obj = departments_data.get(dept_key, {})
@@ -153,6 +171,16 @@ def run_import(dry_run=False, backfill_existing_sites=True):
             client_name = title_case_name(name_raw)
             vehicle = build_vehicle(row)
 
+            delivery_date = (to_iso_date(row.get('ETA')) or 
+                             to_iso_date(row.get('Estimated')) or 
+                             to_iso_date(row.get('Actual')))
+            sales_person = (str(row.get('SP_FULL') or row.get('SP') or row.get('Sales Person') or '').strip()) or None
+            delivery_consultant = (str(row.get('AM_FULL') or row.get('AM') or row.get('Delivery Consultant') or '').strip()) or None
+            trade_in_flag = bool((row.get('TradeInType') or row.get('TradeInStockNo') or row.get('RegoTrade') or '').strip())
+            stock_no = (str(row.get('StockNo') or row.get('Stock No.') or '').strip()) or None
+            if stock_no and '[REMOVED]' in stock_no:
+                stock_no = stock_no.replace('[REMOVED]', '')
+
             # Check if this record already exists in database
             existing = None
             if order_no and order_no in existing_orders:
@@ -167,15 +195,62 @@ def run_import(dry_run=False, backfill_existing_sites=True):
                 existing = existing_signatures[(client_name, phone, vehicle)]
 
             if existing:
+                if existing.get('site_location') == 'Denza Melbourne':
+                    continue
+
                 counts['matched_existing'] += 1
                 counts['by_site_existing'][mapped_site] += 1
-                # If existing client does not have site_location, update it
-                if backfill_existing_sites and not existing.get('site_location'):
+                
+                # Check for fields to update on existing record
+                update_fields = {}
+                if not existing.get('site_location'):
+                    update_fields['site_location'] = mapped_site
+                
+                existing_stage = existing.get('stage')
+                if stage and stage != existing_stage:
+                    if stage == 'Delivered' or STAGE_RANK.get(stage, 0) >= STAGE_RANK.get(existing_stage, 0):
+                        update_fields['stage'] = stage
+                
+                if arrived and not existing.get('arrived'):
+                    update_fields['arrived'] = True
+                    update_fields['arrived_at'] = now
+                
+                if delivery_date and delivery_date != existing.get('delivery_date'):
+                    update_fields['delivery_date'] = delivery_date
+                
+                if rego and rego != existing.get('rego'):
+                    update_fields['rego'] = rego
+                
+                if vin and vin != existing.get('vin'):
+                    update_fields['vin'] = vin
+                
+                if order_no and not existing.get('vy_order_id'):
+                    update_fields['vy_order_id'] = order_no
+                
+                if stock_no and not existing.get('vy_stock_id'):
+                    update_fields['vy_stock_id'] = stock_no
+                
+                if phone and not existing.get('phone'):
+                    update_fields['phone'] = phone
+                
+                if email and not existing.get('email'):
+                    update_fields['email'] = email
+                
+                if sales_person and not existing.get('salesperson'):
+                    update_fields['salesperson'] = sales_person
+                
+                if delivery_consultant and not existing.get('delivery_consultant'):
+                    update_fields['delivery_consultant'] = delivery_consultant
+                
+                if trade_in_flag and not existing.get('trade_in_flag'):
+                    update_fields['trade_in_flag'] = True
+                
+                if update_fields:
+                    update_fields['updated_at'] = now
                     pending_updates.append(
-                        UpdateOne({'id': existing['id']}, {'$set': {'site_location': mapped_site}})
+                        UpdateOne({'id': existing['id']}, {'$set': update_fields})
                     )
-                    existing['site_location'] = mapped_site
-                    counts['existing_sites_updated'] += 1
+                    counts['existing_updated'] += 1
                 continue
 
             # Also check if seen earlier in this run (e.g. multi-department duplicates)
@@ -307,7 +382,7 @@ def run_import(dry_run=False, backfill_existing_sites=True):
     print(f"Skipped blank:                   {counts['skipped_blank']}")
     print(f"Skipped cancelled:               {counts['skipped_cancelled']}")
     print(f"Already in database (skipped):   {counts['matched_existing']}")
-    print(f"Existing clients to update site: {len(pending_updates)}")
+    print(f"Existing clients to update:      {len(pending_updates)}")
     print(f"NEW records to insert:           {counts['new_to_insert']}")
     print("\nNew records by site:")
     for s, n in counts['by_site_new'].items():
@@ -323,7 +398,7 @@ def run_import(dry_run=False, backfill_existing_sites=True):
 
     # Execute updates for existing records
     if pending_updates:
-        print(f"\nUpdating site_location for {len(pending_updates)} existing clients...")
+        print(f"\nUpdating {len(pending_updates)} existing clients with latest SalesLogs data...")
         for i in range(0, len(pending_updates), 500):
             batch = pending_updates[i:i + 500]
             db.clients.bulk_write(batch, ordered=False)

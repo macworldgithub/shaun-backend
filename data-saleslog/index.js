@@ -6,13 +6,13 @@ const path = require("path");
 const BASE_URL = "https://app.saleslogs.com";
 const API_PATH = "/au/v1/Live/GetLiveAllData";
 
-const COOKIE_STRING = `_ga=GA1.1.420777265.1790318978; _gcl_au=1.1.1312080609.1790318978; hubspotutk=2f927912b6d7d04273e104de56c66a14; _fbp=fb.1.1790319016784.487744465716122947; ListUsersSignIn=devs%40omnisuiteai.com; intercom-id-d9uyhb16=d08ee207-2a26-4a4c-81e0-03860a33ede0; intercom-device-id-d9uyhb16=0bb6ee2a-a56c-4740-a942-d1fdc4aedeb9; istrustdevice_xsalelogsslash6m74M4LOwg0l581a5=true; saleslogsmacaddress_xsalelogsslash6m74M4LOwg0l581a5=321c57121ef1b0e7d8a926133bfe47b6; ai_user=ks+8Y|2026-09-27T14:47:51.335Z; __hstc=133144657.2f927912b6d7d04273e104de56c66a14.1790319013921.1790531607954.1791097787905.6; __hssrc=1; SALESLOGSAUTH=%7B%22tokenId%22%3A%22eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1bmlxdWVfbmFtZSI6IjYxNDA5Iiwicm9sZSI6IlNNIiwiYWNjZXNzR3JvdXAiOiJ7XCJzYWxlXCI6dHJ1ZSxcImZpbmFuY2VcIjpmYWxzZSxcImFmdGVybWFya2V0XCI6ZmFsc2UsXCJ0cmFkZWluXCI6ZmFsc2V9IiwibmJmIjoxNzkxMDk3ODA1LCJleHAiOjE3OTExODQyMDUsImlhdCI6MTc5MTA5NzgwNX0.XWONStJakbhat9E6CZ6YFXtpcrrRwY5pgt65ZUWl6oo%22%2C%22role%22%3A%22SM%22%7D; SALESLOGSAUTHLOGIN=User%20Administrator; ASP.NET_SessionId=vwxmpnrjwgnbf10s2yzktg0d; __hssc=133144657.2.1791097787905; siteCoSelect=all; USER1=UserId=xsalelogsslash6m74M4LOwg0l581a5&UserIdHex=C7FEA6EF83382CEC&RoleId=UMJLgjb8yB0g0l581a5&PermissionId=GuaHHjVrf1Ag0l581a5&UserPCompId=RWGsnlDp1rcg0l581a5; USER2=RoleIdName=Sales Manager&RoleInitial=SM&RoleLevel=GuaHHjVrf1Ag0l581a5&PermissionIdName=User Administrator&BetaSignin=F; USER3=UserFirstName=GyVChYWDeWkg0l581a5&UserLastName=NWuKwrtSGgCtJfFV51lzkAg0l581a5g0l581a5&UserInitial=xsalelogsslash6m74M4LOwg0l581a5&UserEmail=a7rPl8C8IFel4431fsalelogsplus1Q3xONpMMrrCdb&UserLandlinePhone=&UserMobilePhone=+61499918523&IsTempPassword=false; USER4=UserApi=a7rPl8C8IFel4431fsalelogsplus1Q3xONpMMrrCdb_api_142a0605c46c048ac0aca8e980d6b759&SessionID=vwxmpnrjwgnbf10s2yzktg0d&SingedUp=1788450666&LastSeen=1791097813&FirstSeen=1788451164&UserLastLogin=10/4/2026 6:10:05 PM; USER5=SPSignin=F&IsShowCalculators=F&SPRestrictedNone=F&IsRestrictedCO=false&UserInitialAccess=&UserIdAccess=H4oxMTElK1Ug0l581a5&IsRestricted=F&IsNewVersion=N&LandingPage=; SaleslogsVersion=DEFAULT; SaleslogsIsVerifyGoogle=AB7B0F58E659CADF; SaleslogsLastMFALastVerify=09/26/2026_Sindh, Pakistan; intercom-session-d9uyhb16=T01xcXEvUTYwSmpuK3RnekJRNThsRjlnVml2MThWem03VjBKa3ZzT2tnaG5WZmRJNlNWY09meWk3cFZYd0ZlVVpPMkM1K2h1VDg4cWNrRVlLYkRvOW45NHN0M3JvTTQvSkFGbE5sR0oweUdZdDN2c29TQzBSNDY5MGFVc2JaRWlkU2t6VmM3T3FtMnhNV1RYRFI4SzdzdEV3Y04zS2h1RlRpN011OVhQclErT0ZkTWxEQlBkWitiSHlvQ1JqOEREV0Zra2EreU16ZGNnckZQREt6WmZuV0VLNkd6MzR4VVZ0Qk9RNitlSEUwalJ6eW1LMHlOS1RCTWN1K1pqcWFyaHd3WTVNRTJjeU5OVnd3UmJNZlFnNGc9PS0tVlQ2eTRrTzhNcTBKUndMem1IeUdydz09--9c1bc3924db183ef73f2f7c25431d10714224ea3; saleslogsActive=1791098023531; _dd_s=aid=907d8360-c3c2-4358-8194-52ee80b85092&rum=2&id=8b7c5bc4-1635-409b-adf2-6786e6fcd2de&created=1791097794342&expire=1791098932359; _ga_XKMWVTW88E=GS2.1.s1791097786$o8$g1$t1791098033$j60$l0$h0; checkShowTempPasswordxsalelogsslash6m74M4LOwg0l581a5=1; fs_lua=1.1791098044364; fs_uid=#XM0G5#8a6cf07e-e7ba-41f5-b0fc-9aac75ab2195:f2d29519-c254-4bf0-a500-2ce085cc7a30:1791097779330::3#52bff52a###/1820149635`;
+const COOKIE_STRING = `ListUsersSignIn=devs%40omnisuiteai.com; istrustdevice_xsalelogsslash6m74M4LOwg0l581a5=true; saleslogsmacaddress_xsalelogsslash6m74M4LOwg0l581a5=321c57121ef1b0e7d8a926133bfe47b6; _gcl_au=1.1.492245970.1791724540; _ga=GA1.1.611897315.1791724540; __hstc=133144657.857b1bbc2e79176d327375815bcbac99.1791724540114.1791724540114.1791724540114.1; hubspotutk=857b1bbc2e79176d327375815bcbac99; __hssrc=1; _fbp=fb.1.1791724540878.464550315706945278; intercom-id-d9uyhb16=f3eb85ad-07e3-4b3f-99a0-24de2983f72d; intercom-session-d9uyhb16=; intercom-device-id-d9uyhb16=b3745dca-9c4a-47b9-b32b-a04759326783; SaleslogsIsVerifyGoogle=AB7B0F58E659CADF; ASP.NET_SessionId=czkjaxu2n0ers4skuqistjtv; __hssc=133144657.2.1791724540114; siteCoSelect=all; SaleslogsVersion=DEFAULT; SaleslogsLastMFALastVerify=09/26/2026_Sindh, Pakistan; saleslogsActive=1791724585315; _dd_s=aid=9f69d6f3-65c6-45ea-9ea2-86dbd0a77088&rum=2&id=3e740ed7-b075-4c7c-9449-56e98d33d911&created=1791724555180&expire=1791725489925; _ga_XKMWVTW88E=GS2.1.s1791724539$o1$g1$t1791724590$j9$l0$h0; ai_user=2rvZk|2026-10-11T13:16:35.731Z; AUTHSALESLOGS={"tokenId":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1bmlxdWVfbmFtZSI6IjYxNDA5Iiwicm9sZSI6IlNNIiwiYWNjZXNzR3JvdXAiOiJ7XCJzYWxlXCI6dHJ1ZSxcImZpbmFuY2VcIjpmYWxzZSxcImFmdGVybWFya2V0XCI6ZmFsc2UsXCJ0cmFkZWluXCI6ZmFsc2V9IiwiVXNlcklkIjoiNjE0MDkiLCJSb2xlSWQiOiIyIiwiUm9sZUlkTmFtZSI6IlNhbGVzIE1hbmFnZXIiLCJSb2xlSW5pdGlhbCI6IlNNIiwiUm9sZUxldmVsIjoiNSIsIlVzZXJQQ29tcElkIjoiMTU0NiIsIkJldGFTaWduaW4iOiJGIiwiU1BTaWduaW4iOiJGIiwiSXNTaG93Q2FsY3VsYXRvcnMiOiJGIiwiU1BSZXN0cmljdGVkTm9uZSI6IkYiLCJJc1Jlc3RyaWN0ZWRDTyI6ImZhbHNlIiwiSXNSZXN0cmljdGVkIjoiRiIsIklzTmV3VmVyc2lvbiI6Ik4iLCJTb3VyY2VWZXJzaW9uIjoiREVGQVVMVCIsIklzVGVtcFBhc3N3b3JkIjoiZmFsc2UiLCJTZXNzaW9uSUQiOiJjemtqYXh1Mm4wZXJzNHNrdXFpc3RqdHYiLCJuYmYiOjE3OTE3MjQ1ODgsImV4cCI6MTc5MTgxMDk4OCwiaWF0IjoxNzkxNzI0NTg4fQ.GvKMGbP9EdkBXDzo0pFRS2lYoEqOQ8gqmZbaqwx5lz4","role":"SM" }; fs_lua=1.1791724595496; fs_uid=#XM0G5#8a6cf07e-e7ba-41f5-b0fc-9aac75ab2195:cf4f8961-b606-4432-82d7-92966de92d80:1791724532495::3#52bff52a###/1820149643; checkShowTempPasswordxsalelogsslash6m74M4LOwg0l581a5=1; ai_session=/+0Xv|1791724597666.8|1791724597666.8`;
 
 // ─── DEPARTMENTS ──────────────────────────────────────────────────────────────
 const DEPARTMENTS = [
   { id: "memlr9lDsalelogsplusvcg0l581a5", name: "BYD Caroline Springs - New" },
-  { id: "9fMiqBnJZjog0l581a5",            name: "BYD Nunawading - New"        },
-  { id: "0JKUwJrlXtMg0l581a5",            name: "Denza Melbourne - New"       },
+  { id: "9fMiqBnJZjog0l581a5", name: "BYD Nunawading - New" },
+  { id: "0JKUwJrlXtMg0l581a5", name: "Denza Melbourne - New" },
 ];
 
 // ─── COOKIE JAR ──────────────────────────────────────────────────────────────
@@ -47,11 +47,11 @@ function parseCsv(csvText) {
   let currentRow = [];
   let currentField = "";
   let insideQuotes = false;
-  
+
   for (let i = 0; i < csvText.length; i++) {
     const char = csvText[i];
     const nextChar = csvText[i + 1];
-    
+
     if (char === '"') {
       if (insideQuotes && nextChar === '"') {
         currentField += '"';
@@ -80,7 +80,7 @@ function parseCsv(csvText) {
     currentRow.push(currentField);
     rows.push(currentRow);
   }
-  
+
   if (rows.length < 2) return [];
   const headers = rows[0].map(h => h.trim());
   return rows.slice(1).map(row => {
@@ -102,25 +102,25 @@ async function apiRequest(body) {
       path: API_PATH,
       method: "POST",
       headers: {
-        "Content-Type":    "application/json; charset=UTF-8",
-        "Content-Length":  Buffer.byteLength(payload),
-        "Accept":          "*/*",
+        "Content-Type": "application/json; charset=UTF-8",
+        "Content-Length": Buffer.byteLength(payload),
+        "Accept": "*/*",
         "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control":   "no-cache",
-        "Origin":          BASE_URL,
-        "Referer":         `${BASE_URL}/au/v1/Live`,
-        "User-Agent":      "Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36",
+        "Cache-Control": "no-cache",
+        "Origin": BASE_URL,
+        "Referer": `${BASE_URL}/au/v1/Live`,
+        "User-Agent": "Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36",
         "X-Requested-With": "XMLHttpRequest",
-        "Cookie":          buildCookieHeader(),
+        "Cookie": buildCookieHeader(),
       },
     }, (res) => {
       parseCookies(res.headers["set-cookie"]);
 
       const enc = res.headers["content-encoding"];
       let stream = res;
-      if (enc === "gzip")    stream = res.pipe(zlib.createGunzip());
+      if (enc === "gzip") stream = res.pipe(zlib.createGunzip());
       if (enc === "deflate") stream = res.pipe(zlib.createInflate());
-      if (enc === "br")      stream = res.pipe(zlib.createBrotliDecompress());
+      if (enc === "br") stream = res.pipe(zlib.createBrotliDecompress());
 
       const chunks = [];
       stream.on("data", c => chunks.push(c));
@@ -137,16 +137,16 @@ async function apiRequest(body) {
 async function fetchDepartment(dept, month) {
   const targetMonth = month || (process.argv[2] ? parseInt(process.argv[2], 10) : 202610);
   const body = {
-    yyyyMM:          12,
-    id:              dept.id,
-    type:            "DEPT",
-    mode:            "new",
-    deleted:         "",
-    select_yyyyMM:   targetMonth,
-    search:          null,
-    RO:              "",
-    Comment:         "",
-    Backordered:     "",
+    yyyyMM: 12,
+    id: dept.id,
+    type: "DEPT",
+    mode: "new",
+    deleted: "",
+    select_yyyyMM: targetMonth,
+    search: null,
+    RO: "",
+    Comment: "",
+    Backordered: "",
     RegoBackordered: "",
   };
 
@@ -193,9 +193,9 @@ async function fetchDepartment(dept, month) {
       if (typeof d === "object" && d !== null) {
         console.log(`  ✅ Keys: ${Object.keys(d).join(", ")}`);
         for (const [key, val] of Object.entries(d)) {
-          if (typeof val === "string")      console.log(`     ${key}: [string, ${val.length} chars]`);
-          else if (Array.isArray(val))      console.log(`     ${key}: [array, ${val.length} items]`);
-          else                              console.log(`     ${key}:`, val);
+          if (typeof val === "string") console.log(`     ${key}: [string, ${val.length} chars]`);
+          else if (Array.isArray(val)) console.log(`     ${key}: [array, ${val.length} items]`);
+          else console.log(`     ${key}:`, val);
         }
 
         // Save raw CSV file as well if listCsv was returned
