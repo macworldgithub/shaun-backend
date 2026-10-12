@@ -1,9 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from typing import Optional, List
 from datetime import datetime, timezone
 import uuid
 
-from db import get_db
+from db import get_db, get_lead_db
+from services.thread_history import history, assert_message_access, phone_key, allowed_site, site_key
+from services.sms_event import phone_pattern, inbound_id, received_at, inbound_document_id
 from models import (
     Message, SendSmsRequest, BulkSmsRequest,
     Template, TemplateCreate, TemplateUpdate, User,
@@ -24,24 +27,22 @@ def _strip(d):
 async def list_messages(
     user: User = Depends(get_current_user),
     client_id: Optional[str] = None,
-    limit: int = Query(200, le=1000),
+    limit: int = Query(200, ge=1, le=1000),
+    site_location: Optional[str] = None,
+    phone: Optional[str] = None,
 ):
-    db = get_db()
-    q = {}
-    if client_id: q['client_id'] = client_id
-    cursor = db.messages.find(q).sort('sent_at', -1).limit(limit)
-    out = []
-    async for d in cursor:
-        out.append(Message(**_strip(d)))
-    return out
+    return [Message(**row) for row in await history(user, client_id, site_location, limit, phone)]
 
 
-async def _record_message(client_id: Optional[str], client_name: Optional[str], phone: str, body: str, user: User, result: dict) -> Message:
+
+async def _record_message(client_id: Optional[str], client_name: Optional[str], phone: str, body: str, user: User, result: dict, site: Optional[str] = None) -> Message:
     db = get_db()
+    client_doc = await db.clients.find_one({'id': client_id}) if client_id else None
     msg = Message(
         client_id=client_id,
         client_name=client_name,
         phone=phone,
+        site=site or (client_doc or {}).get('site_location') or (client_doc or {}).get('site'),
         body=body,
         direction='outbound',
         status=result.get('status', 'queued'),
@@ -69,23 +70,39 @@ async def send_message(payload: SendSmsRequest, user: User = Depends(get_current
     phone = payload.phone
     client_name = None
     client_id = payload.client_id
+    source_site = None
     if client_id:
         client_doc = await db.clients.find_one({'id': client_id})
         if not client_doc:
             raise HTTPException(404, 'Client not found')
+        assert_message_access(user, client_doc)
         phone = client_doc['phone']
         client_name = client_doc['name']
     if not phone:
         raise HTTPException(400, 'phone or client_id required')
+    if not client_doc:
+        clients = await db.clients.find({}).to_list(None)
+        client_doc = next((c for c in clients if phone_key(c.get('phone')) == phone_key(phone) and allowed_site(user, c.get('site_location') or c.get('site')) and (not payload.site or site_key(c.get('site_location') or c.get('site')) == site_key(payload.site))), None)
+        if client_doc:
+            client_id = client_doc['id']
+            client_name = client_doc['name']
+        else:
+            leads = await get_lead_db().leads.find({'phone': {'$regex': phone_pattern(phone)}}).to_list(None)
+            lead_doc = next((lead for lead in leads if allowed_site(user, lead.get('dealer')) and (not payload.site or site_key(lead.get('dealer')) == site_key(payload.site))), None)
+            if not lead_doc:
+                raise HTTPException(404, 'Recipient not found')
+            source_site = lead_doc.get('dealer')
+            client_name = lead_doc.get('name')
     body = payload.body.strip()
     if not body:
         raise HTTPException(400, 'body cannot be empty')
     result = await send_sms(phone, body)
-    msg = await _record_message(client_id, client_name, phone, body, user, result)
+    msg = await _record_message(client_id, client_name, phone, body, user, result, source_site)
     if not result.get('success'):
-        # Surface provider error to client (FastAPI still returns 200 with status='error')
-        msg.status = result.get('status', 'failed')
-        msg.provider_response = result.get('response')
+        return JSONResponse(status_code=502, content={
+            'detail': result.get('error') or 'SMS provider could not accept the message',
+            'message': msg.model_dump(mode='json'),
+        })
     return msg
 
 
@@ -101,6 +118,10 @@ async def send_bulk(payload: BulkSmsRequest, user: User = Depends(get_current_us
         c = client_docs.get(cid)
         if not c:
             failed.append({'client_id': cid, 'error': 'Not found'}); continue
+        try:
+            assert_message_access(user, c)
+        except HTTPException:
+            failed.append({'client_id': cid, 'error': 'Client not found'}); continue
         body = render_template(payload.body, {
             'name': c['name'].split(' ')[0],
             'vehicle': c.get('vehicle', ''),
@@ -173,15 +194,17 @@ async def mobilemessage_inbound(request: Request):
         raise HTTPException(400, 'Invalid JSON')
 
     event_type = (payload.get('type') or '').lower()
-    is_inbound = event_type == 'inbound' or bool(payload.get('message') and payload.get('from'))
+    is_inbound = event_type in ('inbound', 'unsubscribe') or bool((payload.get('message') or payload.get('text') or payload.get('body')) and (payload.get('from') or payload.get('sender') or payload.get('phone')))
 
     if is_inbound:
-        from_phone = normalise_au(payload.get('from') or payload.get('sender') or '')
-        body = payload.get('message') or ''
+        from_phone = normalise_au(payload.get('from') or payload.get('sender') or payload.get('phone') or '')
+        body = str(payload.get('message') or payload.get('body') or payload.get('text') or '').strip()
+        if not from_phone or not body:
+            raise HTTPException(400, 'Missing phone or message body')
         # Try to attach to a known client by phone
         client_doc = None
         if from_phone:
-            client_doc = await db.clients.find_one({'phone': from_phone})
+            client_doc = await db.clients.find_one({'phone': {'$regex': phone_pattern(from_phone)}})
 
         msg = Message(
             client_id=(client_doc or {}).get('id'),
@@ -191,10 +214,20 @@ async def mobilemessage_inbound(request: Request):
             direction='inbound',
             status='received',
             provider='mobilemessage',
-            provider_message_id=payload.get('original_message_id') or payload.get('message_id'),
+            provider_message_id=inbound_id(payload, from_phone, body),
+            sent_at=received_at(payload),
             provider_response=payload,
         )
-        await db.messages.insert_one(msg.model_dump(mode='json'))
+        record = msg.model_dump(mode='json')
+        original_id = payload.get('original_message_id')
+        original = await db.messages.find_one({'provider_message_id': original_id, 'direction': 'outbound'}) if original_id else None
+        source = await get_lead_db().conversations.find_one({'messages.id': original_id}) if original_id else None
+        record['site'] = (original or {}).get('site') or (source or {}).get('dealer') or (client_doc or {}).get('site_location') or (client_doc or {}).get('site') or ''
+        if msg.provider_message_id:
+            from bson import ObjectId
+            await db.messages.update_one({'_id': ObjectId(inbound_document_id(msg.provider_message_id))}, {'$setOnInsert': record}, upsert=True)
+        else:
+            await db.messages.insert_one(record)
         if client_doc:
             await db.clients.update_one(
                 {'id': client_doc['id']},
@@ -204,17 +237,19 @@ async def mobilemessage_inbound(request: Request):
                     'updated_at': datetime.now(timezone.utc),
                 }},
             )
-        return {'success': True, 'event': 'inbound', 'recorded_id': msg.id}
+        return {'success': True, 'event': 'inbound', 'recorded_id': msg.provider_message_id or msg.id}
 
     # Delivery receipt path
     message_id = payload.get('message_id')
     status_val = (payload.get('status') or 'unknown').lower()
     if message_id:
-        await db.messages.update_one(
+        await db.messages.update_many(
             {'provider_message_id': message_id},
             {'$set': {
                 'status': status_val,
                 'provider_response': payload,
             }},
         )
+    if message_id:
+        await get_lead_db().conversations.update_many({'messages.id': message_id}, {'$set': {'messages.$[m].status': status_val}}, array_filters=[{'m.id': message_id}])
     return {'success': True, 'event': 'status', 'status': status_val}

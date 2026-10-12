@@ -430,6 +430,7 @@ class Message(BaseModel):
     client_id: Optional[str] = None
     client_name: Optional[str] = None
     phone: str
+    site: Optional[str] = None
     body: str
     direction: Literal['outbound', 'inbound'] = 'outbound'
     status: str = 'queued'
@@ -441,6 +442,7 @@ class Message(BaseModel):
 
 
 class SendSmsRequest(BaseModel):
+    site: Optional[str] = None
     client_id: Optional[str] = None
     phone: Optional[str] = None  # required if no client_id
     body: str

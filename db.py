@@ -10,6 +10,7 @@ MONGO_URL = os.environ['MONGO_URL']
 DB_NAME = os.environ.get('DB_NAME', 'test_database')
 
 _client: AsyncIOMotorClient | None = None
+_lead_client: AsyncIOMotorClient | None = None
 
 
 def get_client() -> AsyncIOMotorClient:
@@ -21,6 +22,15 @@ def get_client() -> AsyncIOMotorClient:
 
 def get_db():
     return get_client()[DB_NAME]
+
+def get_lead_db():
+    global _lead_client
+    uri = os.environ.get('LEAD_CENTER_MONGO_URI')
+    if not uri:
+        raise RuntimeError('LEAD_CENTER_MONGO_URI is required for cross-platform SMS history')
+    if _lead_client is None:
+        _lead_client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
+    return _lead_client.get_default_database()
 
 
 async def ensure_indexes():
@@ -67,7 +77,10 @@ async def ensure_indexes():
 
 
 def close():
-    global _client
+    global _client, _lead_client
+    if _lead_client is not None:
+        _lead_client.close()
+        _lead_client = None
     if _client is not None:
         _client.close()
         _client = None
