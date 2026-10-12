@@ -12,6 +12,7 @@ Endpoint: POST https://api.mobilemessage.com.au/v1/messages
 import os
 import asyncio
 import logging
+import uuid
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
@@ -26,7 +27,7 @@ log = logging.getLogger('mobilemessage')
 MOBILEMESSAGE_USERNAME = os.environ.get('MOBILEMESSAGE_USERNAME')
 MOBILEMESSAGE_PASSWORD = os.environ.get('MOBILEMESSAGE_PASSWORD')
 MOBILEMESSAGE_FROM = os.environ.get('MOBILEMESSAGE_FROM', '+61468104118')
-MOBILEMESSAGE_URL = os.environ.get('MOBILEMESSAGE_API_URL', 'https://api.mobilemessage.com.au/v1/messages')
+MOBILEMESSAGE_URL = os.environ.get('MOBILEMESSAGE_API_URL', 'https://api.mobilemessage.com.au/v1/messages').rstrip('/')
 if not MOBILEMESSAGE_URL.endswith('/v1/messages'):
     MOBILEMESSAGE_URL = MOBILEMESSAGE_URL.rstrip('/') + '/v1/messages'
 
@@ -47,8 +48,8 @@ def normalise_au(phone: str) -> str:
 
 def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
     username = os.environ.get('MOBILEMESSAGE_USERNAME') or MOBILEMESSAGE_USERNAME
-    password = os.environ.get('MOBILEMESSAGE_PASSWORD') or MOBILEMESSAGE_PASSWORD
-    from_sender = os.environ.get('MOBILEMESSAGE_FROM') or MOBILEMESSAGE_FROM or '+61468104118'
+    password = os.environ.get('MOBILEMESSAGE_PASSWORD') or os.environ.get('MOBILEMESSAGE_API_KEY') or MOBILEMESSAGE_PASSWORD
+    from_sender = os.environ.get('MOBILEMESSAGE_SENDER_ID') or os.environ.get('MOBILEMESSAGE_FROM') or MOBILEMESSAGE_FROM or '+61468104118'
     url = MOBILEMESSAGE_URL
 
     if not username or not password:
@@ -57,9 +58,10 @@ def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
 
     to_norm = normalise_au(to)
     payload = {
+        'enable_unicode': True,
         'messages': [{
             'to': to_norm,
-            'message': body[:1530],
+            'message': body,
             'sender': from_sender,
             **({'custom_ref': custom_ref} if custom_ref else {}),
         }]
@@ -69,6 +71,7 @@ def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
             url,
             auth=(username, password),
             json=payload,
+            headers={'Idempotency-Key': str(uuid.uuid4())},
             timeout=20,
         )
         try:
@@ -89,13 +92,13 @@ def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
             if results:
                 first = results[0]
                 api_status = str(first.get('status', '')).lower()
-                ok = api_status in ('success', 'queued', 'sent', 'accepted')
+                ok = api_status in ('success', 'queued', 'sent', 'accepted') and bool(first.get('message_id'))
                 return {
                     'success': ok,
-                    'status': api_status or 'queued',
+                    'status': api_status if ok else 'failed',
                     'message_id': first.get('message_id'),
                     'price': first.get('cost'),
-                    'error': None if ok else (first.get('error') or first.get('message')),
+                    'error': None if ok else (first.get('error') or first.get('message') or 'SMS provider rejected the message or returned no message ID'),
                     'response': data,
                 }
             return {

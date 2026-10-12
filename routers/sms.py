@@ -6,7 +6,7 @@ import uuid
 
 from db import get_db, get_lead_db
 from services.thread_history import history, assert_message_access, phone_key, allowed_site, site_key
-from services.sms_event import phone_pattern, inbound_id, received_at, inbound_document_id
+from services.sms_event import phone_pattern, inbound_id, received_at, inbound_document_id, inbound_site
 from models import (
     Message, SendSmsRequest, BulkSmsRequest,
     Template, TemplateCreate, TemplateUpdate, User,
@@ -81,7 +81,7 @@ async def send_message(payload: SendSmsRequest, user: User = Depends(get_current
     if not phone:
         raise HTTPException(400, 'phone or client_id required')
     if not client_doc:
-        clients = await db.clients.find({}).to_list(None)
+        clients = await db.clients.find({'phone': {'$regex': phone_pattern(phone)}}).to_list(None)
         client_doc = next((c for c in clients if phone_key(c.get('phone')) == phone_key(phone) and allowed_site(user, c.get('site_location') or c.get('site')) and (not payload.site or site_key(c.get('site_location') or c.get('site')) == site_key(payload.site))), None)
         if client_doc:
             client_id = client_doc['id']
@@ -201,10 +201,13 @@ async def mobilemessage_inbound(request: Request):
         body = str(payload.get('message') or payload.get('body') or payload.get('text') or '').strip()
         if not from_phone or not body:
             raise HTTPException(400, 'Missing phone or message body')
-        # Try to attach to a known client by phone
-        client_doc = None
-        if from_phone:
-            client_doc = await db.clients.find_one({'phone': {'$regex': phone_pattern(from_phone)}})
+        leads = await get_lead_db().leads.find({'phone': {'$regex': phone_pattern(from_phone)}}).to_list(None)
+        clients = await db.clients.find({'phone': {'$regex': phone_pattern(from_phone)}}).to_list(None)
+        original_id = payload.get('original_message_id')
+        original = await db.messages.find_one({'provider_message_id': original_id, 'direction': 'outbound'}) if original_id else None
+        source = await get_lead_db().conversations.find_one({'messages': {'$elemMatch': {'id': original_id, 'sender': {'$ne': 'user'}}}}) if original_id else None
+        site = inbound_site(original, source, leads, clients)
+        client_doc = next((c for c in clients if site and site_key(c.get('site_location') or c.get('site')) == site_key(site)), None)
 
         msg = Message(
             client_id=(client_doc or {}).get('id'),
@@ -219,10 +222,7 @@ async def mobilemessage_inbound(request: Request):
             provider_response=payload,
         )
         record = msg.model_dump(mode='json')
-        original_id = payload.get('original_message_id')
-        original = await db.messages.find_one({'provider_message_id': original_id, 'direction': 'outbound'}) if original_id else None
-        source = await get_lead_db().conversations.find_one({'messages.id': original_id}) if original_id else None
-        record['site'] = (original or {}).get('site') or (source or {}).get('dealer') or (client_doc or {}).get('site_location') or (client_doc or {}).get('site') or ''
+        record['site'] = site
         if msg.provider_message_id:
             from bson import ObjectId
             await db.messages.update_one({'_id': ObjectId(inbound_document_id(msg.provider_message_id))}, {'$setOnInsert': record}, upsert=True)

@@ -33,3 +33,15 @@ def received_at(payload):
 
 def inbound_document_id(ident):
     return hashlib.sha256(('sms-inbound:' + ident).encode('utf-8')).hexdigest()[:24]
+
+
+def inbound_site(original, source, leads, clients):
+    from services.thread_history import site_key
+    original = original or {}
+    original_client = next((c for c in clients if original.get('client_id') and str(original['client_id']) in (str(c.get('id')), str(c.get('_id')))), {})
+    correlated = original.get('site') or original_client.get('site_location') or original_client.get('site') or (source or {}).get('dealer')
+    if correlated:
+        return correlated
+    sites = [l.get('dealer') or l.get('site') for l in leads] + [c.get('site_location') or c.get('site') for c in clients]
+    sites = [site for site in sites if site]
+    return sites[0] if len({site_key(site) for site in sites}) == 1 else ''

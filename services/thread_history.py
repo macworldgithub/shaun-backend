@@ -85,7 +85,7 @@ async def history(user, client_id=None, requested_site=None, limit=200, phone=No
         site = msg.get('site') or (original or {}).get('site') or (original_client or {}).get('site_location') or (correlated_thread or {}).get('dealer') or (source_thread or {}).get('dealer') or (client or {}).get('site_location')
         if not site and len(sites) == 1:
             site = next(r.get('site_location') for r in matched if r.get('site_location'))
-        if not site and len({site_key(s) for s in convo_sites}) == 1:
+        if not site and len(sites) <= 1 and len({site_key(s) for s in convo_sites}) == 1:
             site = next(iter(convo_sites))
         if visible(msg.get('phone'), site):
             msg['id'] = str(msg.get('id') or msg['_id'])
