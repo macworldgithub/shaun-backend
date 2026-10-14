@@ -6,6 +6,13 @@ from dotenv import load_dotenv
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+try:
+    import dns.resolver
+    dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
+    dns.resolver.default_resolver.nameservers = ['8.8.8.8', '8.8.4.4']
+except Exception:
+    pass
+
 MONGO_URL = os.environ['MONGO_URL']
 DB_NAME = os.environ.get('DB_NAME', 'test_database')
 
@@ -74,6 +81,17 @@ async def ensure_indexes():
     await safe_index(db.contractor_job_templates, 'id', unique=True)
     await safe_index(db.contractor_activities, [('job_id', 1), ('created_at', -1)])
     await safe_index(db.contractor_sync_logs, [('synced_at', -1)])
+    # Virtual Yard Deals indexes
+    await safe_index(db.virtual_yard_deals, 'invoice_id', unique=True)
+    await safe_index(db.virtual_yard_deals, 'proposal_number')
+    await safe_index(db.virtual_yard_deals, 'location_name')
+    await safe_index(db.virtual_yard_deals, 'customer_name')
+    await safe_index(db.virtual_yard_deals, 'vehicle')
+    await safe_index(db.virtual_yard_deals, 'status')
+    await safe_index(db.virtual_yard_deals, 'settlement_status')
+    await safe_index(db.virtual_yard_deals, 'sold_date')
+    await safe_index(db.virtual_yard_deals, 'payment_total')
+    await safe_index(db.virtual_yard_deals, 'balance_due')
 
 
 def close():
