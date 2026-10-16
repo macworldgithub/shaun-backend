@@ -13,6 +13,7 @@ from routers.admin import router as admin_router
 from routers.share import router as share_router
 from routers.contractor import router as contractor_router
 from routers.virtualyard import router as virtualyard_router
+from routers.staff import router as staff_router
 from services.notifications import scheduled_workflow_worker
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -64,6 +65,7 @@ app.include_router(admin_router)
 app.include_router(share_router)
 app.include_router(contractor_router)
 app.include_router(virtualyard_router)
+app.include_router(staff_router)
 
 
 @app.get('/api/')
