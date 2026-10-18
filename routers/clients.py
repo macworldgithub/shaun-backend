@@ -252,7 +252,11 @@ async def list_clients(
             {'name': regex}, {'phone': regex}, {'vehicle': regex},
             {'rego': regex}, {'vy_order_id': regex}, {'email': regex},
         ]
-    cursor = db.clients.find(q).sort([('delivery_date', 1), ('created_at', -1)])
+    cursor = (
+        db.clients.find(q, allow_disk_use=True)
+        .sort([('delivery_date', 1), ('created_at', -1)])
+        .allow_disk_use(True)
+    )
     if limit:
         cursor = cursor.limit(limit)
     rows = []

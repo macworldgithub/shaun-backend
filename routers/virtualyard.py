@@ -113,8 +113,13 @@ async def list_deals(
     stats.pop('_id', None)
 
     # Pagination
-    skip = (page - 1) * limit
-    cursor = db.virtual_yard_deals.find(query).sort(mongo_sort).skip(skip).limit(limit)
+    cursor = (
+        db.virtual_yard_deals.find(query, allow_disk_use=True)
+        .sort(mongo_sort)
+        .skip(skip)
+        .limit(limit)
+        .allow_disk_use(True)
+    )
     items = []
     async for doc in cursor:
         items.append(_strip(doc))
