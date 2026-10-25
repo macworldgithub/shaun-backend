@@ -1,4 +1,4 @@
-"""Upsert Caroline Springs and Nunawading SalesLogs without touching Melbourne.
+"""Upsert Caroline Springs and Nunawading SalesLogs, routing DENZA by row SITE.
 Existing IDs and staff workflow fields are retained. Live runs require a backup.
 """
 import argparse
@@ -11,9 +11,6 @@ import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-import dns.resolver
-dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
-dns.resolver.default_resolver.nameservers = ['8.8.8.8', '8.8.4.4']
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dotenv import load_dotenv
 from bson import ObjectId, json_util
@@ -31,6 +28,8 @@ DEPARTMENT_SITE_MAP = {
     'BYD Caroline Springs - New': 'BYD Caroline Springs',
     'BYD Nunawading - New': 'BYD Nunawading',
 }
+DENZA_SITE = 'Denza Melbourne'
+DENZA_SOURCE_SITE = 'Harmony DENZA - VIC'
 PLACEHOLDERS = {'TBA', 'TBC', 'TBD', 'PENDING', 'UNKNOWN', 'NOT AVAILABLE',
                 'NO ALLOCATION', 'NO OPPORTUNITY', 'HOUSE', '-', '?'}
 
@@ -48,7 +47,17 @@ def effective_site(document):
     return document.get('site_location') or document.get('site') or ''
 
 
+def is_denza_source(row):
+    return str((row or {}).get('SITE') or '').strip().casefold() == DENZA_SOURCE_SITE.casefold()
+
+
+def row_site(row, department_site):
+    return DENZA_SITE if is_denza_source(row) else department_site
+
+
 def editable(document):
+    if is_denza_source(document.get('saleslogs_source_data')) or is_denza_source(document):
+        return True
     if any('melbourne' in site_key(document.get(key)) for key in ('site_location', 'site')):
         return False
     return site_key(effective_site(document)) in {site_key(site) for site in DEPARTMENT_SITE_MAP.values()}
@@ -74,7 +83,7 @@ def source_fields(row, site):
         'salesperson': str(row.get('SP_FULL') or row.get('SP') or row.get('Sales Person') or '').strip() or None,
         'secondary_salesperson': str(row.get('SP2_FULL') or '').strip() or None,
         'delivery_consultant': str(row.get('AM_FULL') or row.get('AM') or row.get('Delivery Consultant') or '').strip() or None,
-        'stage': stage, 'arrived': arrived, 'site_location': site,
+        'stage': stage, 'arrived': arrived, 'site_location': row_site(row, site),
         'location': (suburb if 'VIC' in suburb.upper() else f'{suburb}, VIC') if suburb else None,
         'sale_type': sale_type, 'deal_type': pay,
         'trade_in_flag': bool(str(row.get('TradeInType') or row.get('TradeInStockNo') or row.get('RegoTrade') or '').strip()),
@@ -133,14 +142,30 @@ def plan_import(payload, documents, users):
     index = defaultdict(list)
     original = {str(document['_id']): document for document in documents}
     working = {key: dict(document) for key, document in original.items()}
+    patches, inserts, seen, conflicts = {}, {}, {}, []
+    migrated = []
+    # Older exports may no longer contain the deal. Stored source SITE still
+    # identifies its dealership, including cancelled/historical records.
+    for key, document in working.items():
+        if is_denza_source(document.get('saleslogs_source_data')) or is_denza_source(document):
+            patch = {'site_location': DENZA_SITE}
+            if 'site' in document:
+                patch['site'] = DENZA_SITE
+            patch = {field: value for field, value in patch.items() if document.get(field) != value}
+            if patch:
+                patch['updated_at'] = now.isoformat()
+                patches[key] = patch
+                document.update(patch)
+                migrated.append(key)
     for key, document in working.items():
         if editable(document):
             for match_key in record_keys(document):
                 index[(site_key(effective_site(document)), *match_key)].append(key)
-    counts = {site: Counter() for site in DEPARTMENT_SITE_MAP.values()}
-    patches, inserts, seen, conflicts = {}, {}, {}, []
-    for department, site in DEPARTMENT_SITE_MAP.items():
+    counts = {site: Counter() for site in [*DEPARTMENT_SITE_MAP.values(), DENZA_SITE]}
+    for department, department_site in DEPARTMENT_SITE_MAP.items():
+        department_id = departments[department].get('id')
         for row in departments[department]['data']['list']:
+            site = row_site(row, department_site)
             counts[site]['rows'] += 1
             fields, skip_or_location = source_fields(row, site)
             if fields is None:
@@ -150,19 +175,21 @@ def plan_import(payload, documents, users):
             if not source_id:
                 raise ValueError('An eligible SalesLogs row has no stable source id.')
             digest = hashlib.sha256(json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-            source_key = (site, source_id)
+            source_key = (department_id or department, source_id)
             if source_key in seen:
                 if seen[source_key] != digest:
                     raise ValueError(f'Conflicting duplicate source ID {source_id} at {site}')
                 counts[site]['duplicate_source_rows'] += 1
                 continue
             seen[source_key] = digest
-            metadata = {'saleslogs_source_id': source_id, 'saleslogs_department_id': departments[department].get('id'), 'saleslogs_source_hash': digest, 'saleslogs_source_data': row}
+            metadata = {'saleslogs_source_id': source_id, 'saleslogs_department_id': department_id, 'saleslogs_source_hash': digest, 'saleslogs_source_data': row}
             probe = {**fields, 'saleslogs_source_id': source_id}
             matched_keys = []
             for kind, value in record_keys(probe):
-                candidates = list(dict.fromkeys(index.get((site_key(site), kind, value), [])))
+                match_sites = [site, department_site] if site == DENZA_SITE else [site]
+                candidates = list(dict.fromkeys(key for match_site in match_sites for key in index.get((site_key(match_site), kind, value), [])))
                 candidates = [key for key in candidates if not working[key].get('saleslogs_source_id') or identity(working[key]['saleslogs_source_id']) == source_id]
+                candidates = [key for key in candidates if not working[key].get('saleslogs_department_id') or working[key]['saleslogs_department_id'] == department_id]
                 if candidates:
                     if not matched_keys:
                         matched_keys = candidates
@@ -180,6 +207,8 @@ def plan_import(payload, documents, users):
                 key = matched_keys[0]
                 existing = working[key]
                 patch = build_patch(existing, fields, row, now)
+                if 'site' in existing and existing.get('site') != site:
+                    patch['site'] = site
                 patch.update({field: value for field, value in metadata.items() if existing.get(field) != value})
                 if patch:
                     patch['updated_at'] = now.isoformat()
@@ -188,13 +217,15 @@ def plan_import(payload, documents, users):
                         inserts[key].update(patch)
                     else:
                         patches.setdefault(key, {}).update(patch)
+                counts[site]['updated' if patch or key in migrated else 'unchanged'] += 1
                 for match_key in record_keys(existing):
                     index[(site_key(site), *match_key)].append(key)
                 continue
-            stable = hashlib.sha256((site + ':' + source_id).encode()).hexdigest()[:24]
+            # Identity belongs to the source department, not its routed display site.
+            stable = hashlib.sha256((department_site + ':' + source_id).encode()).hexdigest()[:24]
             addons, accessories = extract_addons_and_accessories(row)
             assigned = next((user.get('id') or str(user['_id']) for user in users if user.get('name', '').strip().lower() in {str(fields.get('salesperson') or '').lower(), str(fields.get('delivery_consultant') or '').lower()} and site_key(user.get('locked_site') or user.get('site') or user.get('active_site')) == site_key(site)), None)
-            new = Client(**fields, id=str(uuid.uuid5(uuid.NAMESPACE_URL, 'saleslogs:' + site + ':' + source_id)),
+            new = Client(**fields, id=str(uuid.uuid5(uuid.NAMESPACE_URL, 'saleslogs:' + department_site + ':' + source_id)),
                 addons=addons, accessories=accessories, comments=build_comments(row, skip_or_location if not fields['arrived'] else None),
                 arrived_at=now if fields['arrived'] else None, contact_status=derive_contact_status(row, fields['stage']),
                 assigned_agent_id=assigned, imported_from='saleslogs-json', imported_at=now,
@@ -203,18 +234,11 @@ def plan_import(payload, documents, users):
             new.update(metadata)
             new['_id'] = ObjectId(stable)
             inserts[stable] = new
+            counts[site]['inserted'] += 1
             working[stable] = new
             for match_key in record_keys(new):
                 index[(site_key(site), *match_key)].append(stable)
-    for key, document in original.items():
-        if editable(document) and key in patches:
-            site = next(site for site in counts if site_key(site) == site_key(effective_site(document)))
-            counts[site]['updated'] += 1
-    for document in inserts.values():
-        counts[document['site_location']]['inserted'] += 1
-    for site in counts:
-        counts[site]['unchanged'] = counts[site]['rows'] - sum(counts[site][key] for key in ('skipped_blank', 'skipped_cancelled', 'duplicate_source_rows', 'ambiguous_matches', 'updated', 'inserted'))
-    return {'counts': {site: dict(count) for site, count in counts.items()}, 'patches': patches, 'inserts': inserts, 'conflicts': conflicts, 'original': original}
+    return {'counts': {site: dict(count) for site, count in counts.items()}, 'patches': patches, 'inserts': inserts, 'conflicts': conflicts, 'original': original, 'migrated_to_denza': migrated}
 
 
 def protected_hash(documents):
@@ -225,12 +249,12 @@ def protected_hash(documents):
 def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None):
     json_path = Path(__file__).resolve().parents[1] / 'data-saleslog/response_all_departments.json'
     payload = json.loads(json_path.read_text(encoding='utf-8'))
-    client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=10000)
+    client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=10000, socketTimeoutMS=60000)
     try:
         db = client[DB_NAME]
-        documents = list(db.clients.find({}))
+        documents = list(db.clients.find({}).batch_size(100))
         plan = plan_import(payload, documents, list(db.users.find({'active': True})))
-        summary = {'database': DB_NAME, 'collection': 'clients', 'fetchedAt': payload.get('fetchedAt'), 'dry_run': dry_run, 'by_site': plan['counts'], 'conflicts': plan['conflicts']}
+        summary = {'database': DB_NAME, 'collection': 'clients', 'fetchedAt': payload.get('fetchedAt'), 'dry_run': dry_run, 'by_site': plan['counts'], 'older_records_moved_to_denza': len(plan['migrated_to_denza']), 'conflicts': plan['conflicts']}
         print(json.dumps(summary, indent=2))
         if dry_run:
             return summary
@@ -257,7 +281,7 @@ def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None):
             result.update({'matched': batch.matched_count, 'modified': batch.modified_count, 'inserted': batch.upserted_count})
         if result['modified'] != len(plan['patches']) or result['inserted'] != len(plan['inserts']):
             raise RuntimeError('A record changed concurrently; check the result before retrying.')
-        after = list(db.clients.find({}))
+        after = list(db.clients.find({}).batch_size(100))
         if protected_hash(after) != before_protected:
             raise RuntimeError('Protected-site records changed during this run; investigate concurrent changes.')
         check = plan_import(payload, after, list(db.users.find({'active': True})))
