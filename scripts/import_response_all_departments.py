@@ -1,4 +1,4 @@
-"""Upsert Caroline Springs and Nunawading SalesLogs, routing DENZA by row SITE.
+"""Upsert Caroline Springs and Nunawading SalesLogs, excluding DENZA by default.
 Existing IDs and staff workflow fields are retained. Live runs require a backup.
 """
 import argparse
@@ -134,7 +134,7 @@ def build_patch(existing, fields, row, now):
     return patch
 
 
-def plan_import(payload, documents, users):
+def plan_import(payload, documents, users, include_denza=False):
     departments = payload.get('departments', {})
     if any(not isinstance(departments.get(name, {}).get('data', {}).get('list'), list) for name in DEPARTMENT_SITE_MAP):
         raise ValueError('Fresh deal lists for both requested departments are required.')
@@ -147,7 +147,7 @@ def plan_import(payload, documents, users):
     # Older exports may no longer contain the deal. Stored source SITE still
     # identifies its dealership, including cancelled/historical records.
     for key, document in working.items():
-        if is_denza_source(document.get('saleslogs_source_data')) or is_denza_source(document):
+        if include_denza and (is_denza_source(document.get('saleslogs_source_data')) or is_denza_source(document)):
             patch = {'site_location': DENZA_SITE}
             if 'site' in document:
                 patch['site'] = DENZA_SITE
@@ -158,7 +158,11 @@ def plan_import(payload, documents, users):
                 document.update(patch)
                 migrated.append(key)
     for key, document in working.items():
-        if editable(document):
+        if editable(document) and (include_denza or not (
+            is_denza_source(document.get('saleslogs_source_data'))
+            or is_denza_source(document)
+            or 'denza' in site_key(effective_site(document))
+        )):
             for match_key in record_keys(document):
                 index[(site_key(effective_site(document)), *match_key)].append(key)
     counts = {site: Counter() for site in [*DEPARTMENT_SITE_MAP.values(), DENZA_SITE]}
@@ -167,6 +171,9 @@ def plan_import(payload, documents, users):
         for row in departments[department]['data']['list']:
             site = row_site(row, department_site)
             counts[site]['rows'] += 1
+            if site == DENZA_SITE and not include_denza:
+                counts[site]['skipped_excluded'] += 1
+                continue
             fields, skip_or_location = source_fields(row, site)
             if fields is None:
                 counts[site]['skipped_' + skip_or_location] += 1
@@ -246,14 +253,14 @@ def protected_hash(documents):
     return hashlib.sha256(json_util.dumps(protected, json_options=json_util.CANONICAL_JSON_OPTIONS, sort_keys=True).encode()).hexdigest()
 
 
-def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None):
+def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None, include_denza=False):
     json_path = Path(__file__).resolve().parents[1] / 'data-saleslog/response_all_departments.json'
     payload = json.loads(json_path.read_text(encoding='utf-8'))
     client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=10000, socketTimeoutMS=60000)
     try:
         db = client[DB_NAME]
         documents = list(db.clients.find({}).batch_size(100))
-        plan = plan_import(payload, documents, list(db.users.find({'active': True})))
+        plan = plan_import(payload, documents, list(db.users.find({'active': True})), include_denza=include_denza)
         summary = {'database': DB_NAME, 'collection': 'clients', 'fetchedAt': payload.get('fetchedAt'), 'dry_run': dry_run, 'by_site': plan['counts'], 'older_records_moved_to_denza': len(plan['migrated_to_denza']), 'conflicts': plan['conflicts']}
         print(json.dumps(summary, indent=2))
         if dry_run:
@@ -262,7 +269,13 @@ def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None):
             raise ValueError('Ambiguous existing matches require resolution before applying the import.')
         if not backup_path:
             raise ValueError('A backup path is required for a live import.')
-        before_protected = protected_hash(documents)
+        # Every record outside the plan must survive unchanged, including DENZA
+        # records whose source metadata previously made them editable.
+        untouched_ids = set(plan['original']) - set(plan['patches'])
+        def untouched_hash(rows):
+            untouched = sorted((doc for doc in rows if str(doc['_id']) in untouched_ids), key=lambda doc: str(doc['_id']))
+            return hashlib.sha256(json_util.dumps(untouched, json_options=json_util.CANONICAL_JSON_OPTIONS, sort_keys=True).encode()).hexdigest()
+        before_protected = untouched_hash(documents)
         backup_path = Path(backup_path).resolve()
         with backup_path.open('x', encoding='utf-8') as handle:
             handle.write(json_util.dumps({'database': DB_NAME, 'collection': 'clients', 'backedUpAt': datetime.now(timezone.utc), 'documents': documents}, json_options=json_util.CANONICAL_JSON_OPTIONS))
@@ -282,9 +295,9 @@ def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None):
         if result['modified'] != len(plan['patches']) or result['inserted'] != len(plan['inserts']):
             raise RuntimeError('A record changed concurrently; check the result before retrying.')
         after = list(db.clients.find({}).batch_size(100))
-        if protected_hash(after) != before_protected:
+        if untouched_hash(after) != before_protected:
             raise RuntimeError('Protected-site records changed during this run; investigate concurrent changes.')
-        check = plan_import(payload, after, list(db.users.find({'active': True})))
+        check = plan_import(payload, after, list(db.users.find({'active': True})), include_denza=include_denza)
         if check['patches'] or check['inserts'] or check['conflicts']:
             raise RuntimeError('Post-import verification found remaining changes.')
         print(json.dumps({'applied': dict(result), 'protected_sites_unchanged': True, 'second_run_changes': 0, 'backup': str(backup_path), 'verified': True}))
@@ -297,5 +310,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--backup')
+    parser.add_argument('--include-denza', action='store_true', help='Explicitly include DENZA rows within the two BYD exports and repair historical DENZA site assignments. The separate DENZA export is always ignored.')
     args = parser.parse_args()
-    run_import(dry_run=args.dry_run, backup_path=args.backup)
+    run_import(dry_run=args.dry_run, backup_path=args.backup, include_denza=args.include_denza)

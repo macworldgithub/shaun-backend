@@ -101,11 +101,11 @@ class SaleslogsDepartmentUpsertTests(unittest.TestCase):
         source = payload([row(SITE='Harmony DENZA - VIC')],
                          [row('2001', SITE='Harmony DENZA - VIC')],
                          [row('ignored', SITE='Harmony DENZA - VIC')])
-        plan = plan_import(source, [], [])
+        plan = plan_import(source, [], [], include_denza=True)
         self.assertEqual(len(plan['inserts']), 2)
         self.assertTrue(all(doc['site_location'] == DENZA for doc in plan['inserts'].values()))
         self.assertEqual(plan['counts'][DENZA]['inserted'], 2)
-        second = plan_import(source, applied([], plan), [])
+        second = plan_import(source, applied([], plan), [], include_denza=True)
         self.assertFalse(second['patches'])
         self.assertFalse(second['inserts'])
 
@@ -115,31 +115,54 @@ class SaleslogsDepartmentUpsertTests(unittest.TestCase):
         documents[0]['notes'] = 'Keep staff notes'
         documents[0]['site'] = NUNAWADING
         source = payload(nunawading=[row(SITE='Harmony DENZA - VIC')])
-        plan = plan_import(source, documents, [])
+        plan = plan_import(source, documents, [], include_denza=True)
         self.assertFalse(plan['inserts'])
         result = applied(documents, plan)[0]
         self.assertEqual(result['site_location'], DENZA)
         self.assertEqual(result['site'], DENZA)
         for field in ['_id', 'id', 'notes']:
             self.assertEqual(result[field], documents[0][field])
-        self.assertFalse(plan_import(source, applied(documents, plan), [])['patches'])
+        self.assertFalse(plan_import(source, applied(documents, plan), [], include_denza=True)['patches'])
 
     def test_backfills_historical_and_cancelled_records_missing_from_current_export(self):
         documents = [{'_id': ObjectId(), 'id': 'historical', 'site_location': NUNAWADING,
                       'stage': 'Delivered', 'saleslogs_source_data': {'SITE': 'Harmony DENZA - VIC'}}]
-        plan = plan_import(payload(), documents, [])
+        plan = plan_import(payload(), documents, [], include_denza=True)
         self.assertEqual(len(plan['migrated_to_denza']), 1)
         result = applied(documents, plan)
         self.assertEqual(result[0]['site_location'], DENZA)
         self.assertEqual(result[0]['stage'], 'Delivered')
         self.assertEqual(protected_hash(documents), protected_hash(result))
-        self.assertFalse(plan_import(payload(), result, [])['patches'])
+        self.assertFalse(plan_import(payload(), result, [], include_denza=True)['patches'])
 
     def test_denza_source_ids_are_scoped_by_original_department(self):
         source = payload([row(SITE='Harmony DENZA - VIC')], [row(SITE='Harmony DENZA - VIC')])
-        first = plan_import(source, [], [])
+        first = plan_import(source, [], [], include_denza=True)
         self.assertEqual(len(first['inserts']), 2)
-        self.assertFalse(plan_import(source, applied([], first), [])['patches'])
+        self.assertFalse(plan_import(source, applied([], first), [], include_denza=True)['patches'])
+
+    def test_default_excludes_denza_rows_from_both_byd_departments(self):
+        source = payload([row(), row('denza-cs', SITE='Harmony DENZA - VIC')],
+                         [row('2001'), row('denza-nw', SITE='Harmony DENZA - VIC')],
+                         [row('denza-export', SITE='Harmony DENZA - VIC')])
+        plan = plan_import(source, [], [])
+        self.assertEqual(len(plan['inserts']), 2)
+        self.assertEqual({doc['site_location'] for doc in plan['inserts'].values()}, {CAROLINE, NUNAWADING})
+        self.assertEqual(plan['counts'][DENZA]['skipped_excluded'], 2)
+        self.assertFalse(plan['migrated_to_denza'])
+        self.assertFalse(plan_import(source, applied([], plan), [])['inserts'])
+
+    def test_default_preserves_historical_denza_and_dealer_studio_records(self):
+        documents = [{'_id': ObjectId(), 'id': 'historical', 'site_location': NUNAWADING,
+                      'vy_order_id': 'ORDER1', 'saleslogs_source_data': {'SITE': 'Harmony DENZA - VIC'}},
+                     {'_id': ObjectId(), 'id': 'dealer-studio', 'site_location': DENZA,
+                      'vy_order_id': 'ORDER1', 'imported_from': 'dealer_studio'}]
+        before = deepcopy(documents)
+        plan = plan_import(payload(nunawading=[row()]), documents, [])
+        self.assertFalse(plan['patches'])
+        self.assertFalse(plan['migrated_to_denza'])
+        self.assertEqual(len(plan['inserts']), 1)
+        self.assertEqual(documents, before)
 
 
 if __name__ == '__main__':
