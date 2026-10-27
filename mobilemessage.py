@@ -26,7 +26,7 @@ log = logging.getLogger('mobilemessage')
 
 MOBILEMESSAGE_USERNAME = os.environ.get('MOBILEMESSAGE_USERNAME')
 MOBILEMESSAGE_PASSWORD = os.environ.get('MOBILEMESSAGE_PASSWORD')
-MOBILEMESSAGE_FROM = os.environ.get('MOBILEMESSAGE_FROM', '+61468104118')
+MOBILEMESSAGE_FROM = os.environ.get('MOBILEMESSAGE_FROM', 'HARMONY')
 MOBILEMESSAGE_URL = os.environ.get('MOBILEMESSAGE_API_URL', 'https://api.mobilemessage.com.au/v1/messages').rstrip('/')
 if not MOBILEMESSAGE_URL.endswith('/v1/messages'):
     MOBILEMESSAGE_URL = MOBILEMESSAGE_URL.rstrip('/') + '/v1/messages'
@@ -49,7 +49,7 @@ def normalise_au(phone: str) -> str:
 def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
     username = os.environ.get('MOBILEMESSAGE_USERNAME') or MOBILEMESSAGE_USERNAME
     password = os.environ.get('MOBILEMESSAGE_PASSWORD') or os.environ.get('MOBILEMESSAGE_API_KEY') or MOBILEMESSAGE_PASSWORD
-    from_sender = os.environ.get('MOBILEMESSAGE_SENDER_ID') or os.environ.get('MOBILEMESSAGE_FROM') or MOBILEMESSAGE_FROM or '+61468104118'
+    from_sender = os.environ.get('MOBILEMESSAGE_SENDER_ID') or os.environ.get('MOBILEMESSAGE_FROM') or MOBILEMESSAGE_FROM or 'HARMONY'
     url = MOBILEMESSAGE_URL
 
     if not username or not password:

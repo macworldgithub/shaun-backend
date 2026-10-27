@@ -49,3 +49,14 @@ def test_inbound_site_follows_correlation_and_ambiguous_owners_fail_closed():
     assert inbound_site({'client_id':'delivery-1'},None,leads,clients)=='BYD Melbourne'
     assert inbound_site(None,{'dealer':'BYD Nunawading'},leads,clients)=='BYD Nunawading'
     assert inbound_site(None,None,[{'dealer':'Melbourne CBD'}],clients)=='Melbourne CBD'
+
+
+def test_branded_sender_overrides_legacy_number():
+    def respond(url, **kwargs):
+        assert kwargs['json']['messages'][0]['sender'] == 'HARMONY'
+        return SimpleNamespace(status_code=200, json=lambda: {'results': [{'status': 'SUCCESS', 'message_id': 'harmony-id'}]})
+
+    with environment(), patch.dict(mobilemessage.os.environ, {'MOBILEMESSAGE_SENDER_ID': 'HARMONY', 'MOBILEMESSAGE_FROM': '+61468104118'}), patch.object(mobilemessage.requests, 'post', side_effect=respond):
+        result = mobilemessage._send_sync('0499918523', 'Hello from Harmony')
+    assert result['success'] is True
+    assert result['message_id'] == 'harmony-id'
