@@ -1,0 +1,11 @@
+{
+  "verified": true,
+  "database": "byd-panel",
+  "deleted_denza_saleslogs": 325,
+  "remaining_denza_saleslogs": 0,
+  "dealer_studio_denza_preserved": 349,
+  "before_total": 4507,
+  "after_total": 4182,
+  "backup": "D:\\sales-floor\\shaun-backend\\backups\\denza_saleslogs_removed_20261025T1820.json",
+  "completedAt": "2026-10-25T18:25:51.401987+00:00"
+}
