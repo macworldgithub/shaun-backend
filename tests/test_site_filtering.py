@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import sys
 import pytest
 from pathlib import Path
@@ -46,9 +47,10 @@ async def test_api_site_filtering(database):
             expected = database.clients.count_documents({
                 'site_location': {'$regex': f'^{re.escape(site)}$', '$options': 'i'},
             })
-            clients = await list_clients(user=admin, site_location=site, limit=50)
+            response = await list_clients(user=admin, site_location=site, limit=50)
+            clients = json.loads(response.body)
             assert len(clients) == min(50, expected)
-            assert all(c.site_location.casefold() == site.casefold() for c in clients)
+            assert all(c['site_location'].casefold() == site.casefold() for c in clients)
             site_stats = await stats(site_location=site, user=admin)
             assert site_stats['total_clients'] == expected
             assert sum(site_stats['by_stage'].values()) == expected

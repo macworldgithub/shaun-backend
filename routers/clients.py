@@ -1,15 +1,18 @@
 from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException, Query, Request, status
 from fastapi.responses import Response
-from typing import Optional, List
+from typing import Annotated, Optional, List
 from datetime import datetime, timezone, timedelta
 import re
 import secrets
 import os
 import uuid
 import hashlib
+import gzip
 import httpx
 from io import BytesIO
 from PIL import Image
+from pydantic import TypeAdapter
+from starlette.concurrency import run_in_threadpool
 
 from db import get_db
 from models import (
@@ -26,6 +29,39 @@ from services.crm_webhook import dispatch_crm_webhook
 from services.contractor_service import sync_client_updates_to_contractor_jobs
 
 router = APIRouter(prefix='/api/clients', tags=['clients'])
+
+# Fetch only fields exposed by the API, leaving import/provider payloads in MongoDB.
+CLIENT_PROJECTION = {field: 1 for field in Client.model_fields}
+CLIENT_PROJECTION['_id'] = 0
+CLIENT_LIST_ADAPTER = TypeAdapter(List[Client])
+
+
+def _accepts_gzip(accept_encoding):
+    encodings = {}
+    for entry in accept_encoding.lower().split(','):
+        encoding, *parameters = entry.strip().split(';')
+        quality = 1.0
+        for parameter in parameters:
+            key, _, value = parameter.strip().partition('=')
+            if key == 'q':
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0.0
+        encodings[encoding] = quality
+    return encodings.get('gzip', encodings.get('*', 0)) > 0
+
+
+def _client_list_response(rows, accept_encoding=''):
+    # Validate business rules once and encode directly to JSON bytes. Running this
+    # in a worker keeps large lists from blocking unrelated API requests.
+    clients = CLIENT_LIST_ADAPTER.validate_python(rows)
+    body = CLIENT_LIST_ADAPTER.dump_json(clients)
+    headers = {'Vary': 'Accept-Encoding'}
+    if len(body) >= 1000 and _accepts_gzip(accept_encoding):
+        body = gzip.compress(body, compresslevel=5)
+        headers['Content-Encoding'] = 'gzip'
+    return Response(body, media_type='application/json', headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +253,7 @@ def _has_signed_handover(client: dict) -> bool:
 @router.get('', response_model=List[Client])
 async def list_clients(
     user: User = Depends(get_current_user),
+    request: Request = None,
     stage: Optional[str] = None,
     contact_status: Optional[str] = None,
     assigned_agent_id: Optional[str] = None,
@@ -225,7 +262,8 @@ async def list_clients(
     mine: Optional[bool] = None,
     search: Optional[str] = None,
     site_location: Optional[str] = None,
-    limit: Optional[int] = 5000,
+    limit: Annotated[int, Query(ge=1, le=5000)] = 5000,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
     db = get_db()
     q: dict = {}
@@ -248,21 +286,23 @@ async def list_clients(
         q['site_location'] = {'$regex': f'^{escaped}$', '$options': 'i'}
     if search:
         regex = {'$regex': search, '$options': 'i'}
-        q['$or'] = (q.get('$or', [])) + [
+        search_filter = {'$or': [
             {'name': regex}, {'phone': regex}, {'vehicle': regex},
             {'rego': regex}, {'vy_order_id': regex}, {'email': regex},
-        ]
+        ]}
+        # Search narrows the selected assignment filter instead of widening it.
+        q.setdefault('$and', []).append(search_filter)
     cursor = (
-        db.clients.find(q, allow_disk_use=True)
+        db.clients.find(q, CLIENT_PROJECTION, allow_disk_use=True)
         .sort([('delivery_date', 1), ('created_at', -1)])
         .allow_disk_use(True)
+        .skip(offset)
+        .limit(limit)
+        .batch_size(min(limit, 1000))
     )
-    if limit:
-        cursor = cursor.limit(limit)
-    rows = []
-    async for doc in cursor:
-        rows.append(Client(**_strip(doc)))
-    return rows
+    rows = await cursor.to_list(length=limit)
+    accept_encoding = request.headers.get('accept-encoding', '') if request else ''
+    return await run_in_threadpool(_client_list_response, rows, accept_encoding)
 
 
 @router.post('', response_model=Client, status_code=status.HTTP_201_CREATED)
@@ -698,7 +738,7 @@ async def upload_from_customer_link(
 @router.get('/{client_id}', response_model=Client)
 async def get_client(client_id: str, user: User = Depends(get_current_user)):
     db = get_db()
-    doc = await db.clients.find_one({'id': client_id})
+    doc = await db.clients.find_one({'id': client_id}, CLIENT_PROJECTION)
     if not doc:
         raise HTTPException(404, 'Client not found')
     assert_site_access(user, doc)

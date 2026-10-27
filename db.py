@@ -50,6 +50,8 @@ async def ensure_indexes():
             pass
 
     await safe_index(db.users, 'email', unique=True)
+    await safe_index(db.users, 'id')
+    await safe_index(db.clients, 'id')
     await safe_index(db.clients, 'vy_order_id')
     await safe_index(db.clients, 'assigned_agent_id')
     await safe_index(db.clients, 'contact_status')
