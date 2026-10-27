@@ -9,6 +9,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from db import get_db
 from models import User, UserInDB
+from services.account_access import has_platform, resolve_site, site_key
 
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGO = os.environ.get('JWT_ALGO', 'HS256')
@@ -85,14 +86,19 @@ async def get_current_user(
     if not user_id:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, 'Invalid token')
     user = await _load_user(user_id)
-    if not user or not user.active:
+    if not user or not user.active or user.deleted_at or payload.get('auth_version', 0) != user.auth_version:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, 'User not found or inactive')
-    return User(**user.model_dump(exclude={'password_hash'}))
+    if not has_platform(user, 'delivery_centre'):
+        raise HTTPException(403, 'Delivery Centre access is not assigned to this account')
+    result = User(**user.model_dump(exclude={'password_hash'}))
+    result.request_site = resolve_site(user, request.headers.get('x-site') or request.query_params.get('site_location') or request.query_params.get('site'))
+    return result
 
 
 def require_role(*roles: str):
     async def _dep(user: User = Depends(get_current_user)) -> User:
-        if user.role not in roles:
+        role = {'site_admin': 'admin', 'delivery_consultant': 'delivery'}.get(user.role, user.role)
+        if role not in roles:
             raise HTTPException(status.HTTP_403_FORBIDDEN, 'Insufficient permissions')
         return user
     return _dep
@@ -104,9 +110,15 @@ require_contractor = require_role('contractor')
 require_contractor_or_admin = require_role('super_admin', 'admin', 'contractor')
 
 
+async def require_user_manager(user: User = Depends(get_current_user)) -> User:
+    if user.role != 'super_admin' or str(user.email).strip().lower() != 'devs@omnisuiteai.com':
+        raise HTTPException(403, 'User management requires the devs@omnisuiteai.com super admin account')
+    return user
+
+
 def effective_site(user: User, requested: Optional[str] = None) -> Optional[str]:
     """Site-locked users are always pinned to their locked_site, whatever was requested."""
-    locked = getattr(user, 'locked_site', None)
+    locked = getattr(user, 'request_site', None) or getattr(user, 'locked_site', None)
     if locked:
         return locked
     return requested
@@ -114,10 +126,10 @@ def effective_site(user: User, requested: Optional[str] = None) -> Optional[str]
 
 def assert_site_access(user: User, doc: Optional[dict]) -> None:
     """Raise 404 when a site-locked user touches a record from another site."""
-    locked = getattr(user, 'locked_site', None)
+    locked = getattr(user, 'request_site', None) or getattr(user, 'locked_site', None)
     if not locked or not doc:
         return
-    if (doc.get('site_location') or '').strip().lower() != locked.strip().lower():
+    if site_key(doc.get('site_location')) != site_key(locked):
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'Client not found')
 
 

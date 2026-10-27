@@ -14,7 +14,7 @@ def _id() -> str:
 
 UserRole = Literal[
     'super_admin', 'admin', 'agent', 'contractor',
-    'manager', 'sales_manager', 'sales_consultant', 'consultant', 'bdc', 'delivery'
+    'manager', 'sales_manager', 'sales_consultant', 'consultant', 'bdc', 'delivery', 'site_admin', 'delivery_consultant'
 ]
 
 
@@ -28,6 +28,12 @@ class User(BaseModel):
     active_site: Optional[str] = 'Fairfield'
     # When set, the user can only see/act on data from this site (server-enforced)
     locked_site: Optional[str] = None
+    allowed_sites: Optional[List[str]] = None
+    all_sites: Optional[bool] = None
+    platform_access: Optional[List[str]] = None
+    auth_version: int = 0
+    deleted_at: Optional[datetime] = None
+    request_site: Optional[str] = Field(default=None, exclude=True)
     company_name: Optional[str] = None
     contractor_phone: Optional[str] = None
     contractor_skills: List[str] = Field(default_factory=list)

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from datetime import datetime, timezone
 
 from db import get_db
+from services.account_access import has_platform
 from models import (
     User, UserInDB, LoginRequest, TokenResponse, ChangePasswordRequest,
 )
@@ -39,6 +40,8 @@ async def login(payload: LoginRequest, request: Request):
     if not verify_password(payload.password, user_db.password_hash):
         await _audit(request, {'id': user_db.id, 'email': user_db.email}, 'login.failed')
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, 'Invalid email or password')
+    if not has_platform(user_db, 'delivery_centre'):
+        raise HTTPException(403, 'Delivery Centre access is not assigned to this account')
 
     await db.users.update_one(
         {'id': user_db.id},
@@ -46,7 +49,7 @@ async def login(payload: LoginRequest, request: Request):
     )
     user = User(**user_db.model_dump(exclude={'password_hash'}))
     user.last_login_at = datetime.now(timezone.utc)
-    token = create_token(user.id, user.role)
+    token = create_token(user.id, user.role, extra={'auth_version': user.auth_version})
     await _audit(request, {'id': user.id, 'email': user.email}, 'login.success')
     return TokenResponse(access_token=token, user=user)
 
@@ -73,7 +76,7 @@ async def change_password(
         {'$set': {
             'password_hash': hash_password(payload.new_password),
             'must_change_password': False,
-        }},
+        }, '$inc': {'auth_version': 1}},
     )
     await _audit(request, {'id': user.id, 'email': user.email}, 'password.changed')
     return {'success': True}

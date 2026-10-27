@@ -320,8 +320,8 @@ async def create_client(payload: ClientBase, user: User = Depends(get_current_us
         if existing:
             raise HTTPException(409, 'Client with this VY order ID already exists')
     client = Client(**payload.model_dump())
-    if getattr(user, 'locked_site', None):
-        client.site_location = user.locked_site
+    if effective_site(user):
+        client.site_location = effective_site(user)
     await db.clients.insert_one(client.model_dump(mode='json'))
     return client
 

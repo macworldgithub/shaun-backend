@@ -11,7 +11,7 @@ from models import (
 )
 from auth import (
     get_current_user, require_admin, require_super, effective_site,
-    hash_password, generate_password,
+    hash_password, generate_password, require_user_manager,
 )
 from services.harmony_import import import_harmony_from_bytes
 
@@ -23,12 +23,23 @@ def _strip(d):
     return d
 
 
+async def _editable_user(db, uid):
+    target = await db.users.find_one({'id': uid})
+    if not target:
+        raise HTTPException(404, 'User not found')
+    if str(target.get('email', '')).strip().lower() == 'devs@omnisuiteai.com':
+        raise HTTPException(400, 'The owner account is protected')
+    if isinstance(target.get('platform_access'), list):
+        raise HTTPException(409, 'Manage this account in Sales CRM → Users & Access to keep all platforms synchronized')
+    return target
+
+
 # ----- Users -----
 @router.get('/users', response_model=List[User])
 async def list_users(
     role: Optional[str] = None,
     active_only: bool = False,
-    _: User = Depends(require_admin)
+    _: User = Depends(require_user_manager)
 ):
     db = get_db()
     query = {}
@@ -44,7 +55,7 @@ async def list_users(
 
 
 @router.post('/users')
-async def create_user(payload: UserCreate, request: Request, admin: User = Depends(require_admin)):
+async def create_user(payload: UserCreate, request: Request, admin: User = Depends(require_user_manager)):
     db = get_db()
     email = payload.email.lower()
     if await db.users.find_one({'email': email}):
@@ -76,12 +87,13 @@ async def create_user(payload: UserCreate, request: Request, admin: User = Depen
 
 
 @router.patch('/users/{uid}', response_model=User)
-async def update_user(uid: str, payload: UserUpdate, admin: User = Depends(require_admin)):
+async def update_user(uid: str, payload: UserUpdate, admin: User = Depends(require_user_manager)):
     db = get_db()
+    await _editable_user(db, uid)
     update = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
     if 'role' in update and update['role'] == 'super_admin' and admin.role != 'super_admin':
         raise HTTPException(403, 'Only super admins can grant super admin')
-    res = await db.users.find_one_and_update({'id': uid}, {'$set': update}, return_document=True)
+    res = await db.users.find_one_and_update({'id': uid}, {'$set': update, '$inc': {'auth_version': 1}}, return_document=True)
     if not res:
         raise HTTPException(404, 'User not found')
     res.pop('password_hash', None)
@@ -89,25 +101,24 @@ async def update_user(uid: str, payload: UserUpdate, admin: User = Depends(requi
 
 
 @router.post('/users/{uid}/reset-password')
-async def reset_password(uid: str, admin: User = Depends(require_admin)):
+async def reset_password(uid: str, admin: User = Depends(require_user_manager)):
     db = get_db()
-    target = await db.users.find_one({'id': uid})
-    if not target:
-        raise HTTPException(404, 'User not found')
+    target = await _editable_user(db, uid)
     new_pw = generate_password()
     await db.users.update_one(
         {'id': uid},
-        {'$set': {'password_hash': hash_password(new_pw), 'must_change_password': True}},
+        {'$set': {'password_hash': hash_password(new_pw), 'must_change_password': True}, '$inc': {'auth_version': 1}},
     )
     return {'temp_password': new_pw}
 
 
 @router.delete('/users/{uid}')
-async def deactivate_user(uid: str, admin: User = Depends(require_admin)):
+async def deactivate_user(uid: str, admin: User = Depends(require_user_manager)):
     db = get_db()
+    await _editable_user(db, uid)
     if admin.id == uid:
         raise HTTPException(400, 'Cannot deactivate your own account')
-    res = await db.users.update_one({'id': uid}, {'$set': {'active': False}})
+    res = await db.users.update_one({'id': uid}, {'$set': {'active': False}, '$inc': {'auth_version': 1}})
     if res.matched_count == 0:
         raise HTTPException(404, 'User not found')
     return {'success': True}
