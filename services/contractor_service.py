@@ -501,14 +501,24 @@ async def clock_out_contractor(
         }
     )
 
-    # Accumulate into job's total_time_seconds
-    await db.contractor_jobs.update_one(
-        {'id': job_id},
-        {
-            '$inc': {'total_time_seconds': duration},
-            '$set': {'updated_at': now}
-        }
-    )
+    # Accumulate into job's total_time_seconds and individual task if task_id set
+    task_id = active_entry.get('task_id')
+    if task_id:
+        await db.contractor_jobs.update_one(
+            {'id': job_id, 'checklist.id': task_id},
+            {
+                '$inc': {'total_time_seconds': duration, 'checklist.$.duration_seconds': duration},
+                '$set': {'updated_at': now}
+            }
+        )
+    else:
+        await db.contractor_jobs.update_one(
+            {'id': job_id},
+            {
+                '$inc': {'total_time_seconds': duration},
+                '$set': {'updated_at': now}
+            }
+        )
 
     mins = duration // 60
     await log_job_activity(
@@ -526,6 +536,11 @@ async def clock_out_contractor(
     await sync_job_to_delivery_client(db, job_id, contractor_name)
 
     updated_entry = await db.contractor_time_logs.find_one({'id': active_entry['id']})
+    if not updated_entry or updated_entry.get('duration_seconds') is None:
+        active_entry['duration_seconds'] = duration
+        active_entry['clock_out'] = now
+        active_entry['notes'] = notes or active_entry.get('notes')
+        return JobTimeEntry(**_strip(active_entry))
     return JobTimeEntry(**_strip(updated_entry))
 
 
@@ -668,12 +683,32 @@ async def compute_contractor_analytics(
     avg_job_minutes = round((total_time_seconds / jobs_with_time) / 60, 1) if jobs_with_time > 0 else 0
     completion_rate = round((completed_jobs / total_jobs * 100), 1) if total_jobs > 0 else 0.0
 
+    # Per-task average time aggregation
+    task_durations: Dict[str, List[int]] = {}
+    async for j in db.contractor_jobs.find(query):
+        for task in j.get('checklist', []):
+            t_dur = task.get('duration_seconds', 0)
+            t_title = (task.get('title') or '').strip()
+            if t_title and t_dur > 0:
+                task_durations.setdefault(t_title, []).append(t_dur)
+
+    average_time_per_task = [
+        {
+            'task_title': title,
+            'avg_minutes': round((sum(durs) / len(durs)) / 60, 1),
+            'total_completed': len(durs)
+        }
+        for title, durs in task_durations.items()
+    ]
+    average_time_per_task.sort(key=lambda x: x['total_completed'], reverse=True)
+
     return {
         'total_jobs': total_jobs,
         'completed_jobs': completed_jobs,
         'completion_rate_percent': completion_rate,
         'overdue_jobs_count': overdue_count,
         'average_time_minutes': avg_job_minutes,
+        'average_time_per_task': average_time_per_task,
         'jobs_by_status': jobs_by_status,
         'jobs_by_model': jobs_by_model,
         'jobs_by_contractor': jobs_per_contractor,
@@ -1293,4 +1328,97 @@ async def bulk_import_contractor_jobs(
         created_job_ids=created_ids,
         results=results
     )
+
+
+# ---------------------------------------------------------------------------
+# Scheduled Polling Fallback (Spec §6: Polling every 5–15 minutes)
+# ---------------------------------------------------------------------------
+async def poll_delivery_centre_integration(db) -> Dict[str, Any]:
+    """
+    Scheduled Polling Worker (every 5-15 mins) for two-way sync with deliverycentre.com.au.
+    1. Scans Delivery Centre clients with accessories / pending aftermarket tasks.
+    2. Auto-creates contractor jobs if they don't already exist.
+    3. Syncs updated due dates and urgency flags from Delivery Centre to existing contractor jobs.
+    4. Syncs contractor completed jobs back to Delivery Centre clients.
+    """
+    now = datetime.now(timezone.utc)
+    created_count = 0
+    updated_count = 0
+    synced_back_count = 0
+
+    if not hasattr(db, 'clients'):
+        return {'status': 'skipped', 'message': 'No clients collection available'}
+
+    try:
+        cursor = db.clients.find({'stage': {'$nin': ['Delivered', 'Cancelled']}})
+        if hasattr(cursor, 'limit'):
+            cursor = cursor.limit(200)
+        async for client in cursor:
+            c_id = client.get('id')
+            if not c_id:
+                continue
+
+            has_accessories = bool(client.get('accessories'))
+            delivery_date = client.get('delivery_date')
+            vin = client.get('vin')
+
+            # Check if a contractor job already exists for this client or VIN
+            filter_query = {'$or': [{'client_id': c_id}, {'dc_job_id': c_id}]}
+            if vin:
+                filter_query['$or'].append({'full_vin': vin})
+
+            job = await db.contractor_jobs.find_one(filter_query)
+
+            if not job:
+                # If client needs accessories fitted or is in pre-delivery prep, auto-create contractor job
+                if has_accessories or client.get('stage') in ('Ready for Delivery', 'Pre-Delivery', 'Registration'):
+                    try:
+                        new_job = await create_job_from_delivery_client(
+                            db=db,
+                            client_id=c_id,
+                            due_date=delivery_date
+                        )
+                        created_count += 1
+                        sync_log = IntegrationSyncLog(
+                            job_id=new_job.id,
+                            client_id=c_id,
+                            direction='inbound_to_contractor',
+                            event='polling.job_auto_created',
+                            status='success',
+                            details={'vin': vin, 'model': client.get('vehicle')},
+                            synced_at=now
+                        )
+                        await db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json'))
+                    except Exception as ex:
+                        log.warning("Could not auto-create job for client %s: %s", c_id, ex)
+            else:
+                # Job exists - sync due dates and delivery dates if changed on client
+                updates = {}
+                if delivery_date and job.get('delivery_date_time') != delivery_date:
+                    updates['delivery_date_time'] = delivery_date
+                    if not job.get('due_date'):
+                        updates['due_date'] = delivery_date
+                if updates:
+                    updates['updated_at'] = now
+                    updates['last_synced_at'] = now
+                    updates['sync_status'] = 'synced'
+                    await db.contractor_jobs.update_one({'id': job['id']}, {'$set': updates})
+                    updated_count += 1
+
+        # Also find completed contractor jobs that need outbound sync to Delivery Centre
+        async for cjob in db.contractor_jobs.find({'status': {'$in': ['completed', 'returned']}, 'sync_status': {'$ne': 'synced'}}):
+            await sync_job_to_delivery_client(db, cjob['id'], 'Scheduled Poller')
+            synced_back_count += 1
+
+        log.info("Polling sync finished: %d created, %d updated, %d synced back", created_count, updated_count, synced_back_count)
+        return {
+            'status': 'success',
+            'created_jobs': created_count,
+            'updated_jobs': updated_count,
+            'synced_back_jobs': synced_back_count,
+            'synced_at': now.isoformat()
+        }
+    except Exception as e:
+        log.exception("Polling sync error: %s", e)
+        return {'status': 'error', 'error': str(e)}
 

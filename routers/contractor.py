@@ -20,7 +20,8 @@ from models import (
     IntegrationSyncLog, ConvertClientToJobRequest,
     PushSubscriptionPayload, SendPushTestRequest,
     BulkJobImportRequest, BulkJobImportResponse,
-    OfflineBatchSyncRequest, OfflineBatchSyncResponse
+    OfflineBatchSyncRequest, OfflineBatchSyncResponse,
+    ClientDocument
 )
 from auth import (
     get_current_user, require_admin, require_super,
@@ -41,7 +42,8 @@ from services.contractor_service import (
     generate_contractor_jobs_xlsx,
     generate_contractor_jobs_pdf,
     process_offline_batch_sync,
-    bulk_import_contractor_jobs
+    bulk_import_contractor_jobs,
+    poll_delivery_centre_integration
 )
 from services.push_service import (
     get_vapid_public_key,
@@ -690,6 +692,33 @@ async def upload_job_evidence(
         meta={'evidence_id': evidence.id, 'stage': stage}
     )
 
+    # Mirror evidence directly to Delivery Centre client documents if linked
+    client_id = job.get('client_id') or job.get('dc_job_id')
+    if client_id and hasattr(db, 'clients'):
+        try:
+            client_doc = ClientDocument(
+                id=evidence.id,
+                client_id=client_id,
+                document_type='Other',
+                status='complete',
+                file_name=f"[{stage.upper()}] {fname}",
+                source='staff-upload',
+                uploaded_by=user.name,
+                storage_path=storage_path,
+                content_type=content_type,
+                size_bytes=len(file_bytes),
+                notes=f"Contractor evidence ({stage.capitalize()}): {caption or 'Uploaded via Contractor App'}"
+            )
+            await db.clients.update_one(
+                {'id': client_id},
+                {
+                    '$push': {'documents': client_doc.model_dump(mode='json')},
+                    '$set': {'updated_at': datetime.now(timezone.utc)}
+                }
+            )
+        except Exception as doc_err:
+            log.warning("Could not mirror evidence to client %s documents: %s", client_id, doc_err)
+
     return evidence
 
 
@@ -1201,26 +1230,163 @@ async def get_sync_status(_: User = Depends(require_admin)):
 @router.post('/integrations/webhook')
 async def receive_external_webhook(request: Request):
     """
-    Receives incoming webhooks from external systems or Delivery Centre events.
+    Receives incoming webhooks from Delivery Centre events with automatic job actions:
+    - client.created / job.request / accessory.added: Auto-creates job
+    - job.due_date_updated / due_date.updated: Updates due date
+    - job.urgent_flag / urgent.flagged: Flags job as urgent & sends push alert
+    - job.updated / client.updated: Synchronizes changes
     """
     db = get_db()
     payload = await request.json()
-    event = payload.get('event')
+    event = payload.get('event') or 'webhook.received'
     client_id = payload.get('client_id')
+    vin = payload.get('vin') or payload.get('full_vin')
+    now = datetime.now(timezone.utc)
+    processed_action = 'logged'
 
-    log.info("Received integration webhook: event=%s, client_id=%s", event, client_id)
+    log.info("Received integration webhook: event=%s, client_id=%s, vin=%s", event, client_id, vin)
 
-    # Example: If a client has accessories updated in Delivery Centre, auto-sync or log
-    sync_log = IntegrationSyncLog(
-        client_id=client_id,
-        direction='inbound_to_contractor',
-        event=event or 'webhook.received',
-        status='success',
-        details=payload
-    )
-    await db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json'))
+    try:
+        # 1. Job Creation / New Request
+        if event in ('client.created', 'job.request', 'delivery.scheduled', 'accessory.added') and client_id:
+            existing_job = await db.contractor_jobs.find_one({
+                '$or': [{'client_id': client_id}, {'dc_job_id': client_id}]
+            })
+            if not existing_job:
+                new_job = await create_job_from_delivery_client(
+                    db=db,
+                    client_id=client_id,
+                    due_date=payload.get('due_date') or payload.get('delivery_date'),
+                    is_urgent=bool(payload.get('is_urgent', False))
+                )
+                processed_action = f'job_created:{new_job.id}'
+            else:
+                processed_action = f'job_already_exists:{existing_job["id"]}'
 
-    return {'received': True, 'event': event}
+        # 2. Due Date Updated
+        elif event in ('job.due_date_updated', 'due_date.updated', 'delivery_date.updated'):
+            new_due = payload.get('due_date') or payload.get('delivery_date')
+            if new_due and (client_id or vin):
+                q = {'$or': []}
+                if client_id:
+                    q['$or'].extend([{'client_id': client_id}, {'dc_job_id': client_id}])
+                if vin:
+                    q['$or'].append({'full_vin': vin})
+                res = await db.contractor_jobs.update_many(q, {
+                    '$set': {'due_date': new_due, 'delivery_date_time': new_due, 'updated_at': now, 'last_synced_at': now}
+                })
+                processed_action = f'due_date_updated:{res.modified_count}'
+
+        # 3. Urgent Flagged
+        elif event in ('job.urgent_flag', 'urgent.flagged', 'priority.urgent'):
+            q = {'$or': []}
+            if client_id:
+                q['$or'].extend([{'client_id': client_id}, {'dc_job_id': client_id}])
+            if vin:
+                q['$or'].append({'full_vin': vin})
+            if q['$or']:
+                target_job = await db.contractor_jobs.find_one(q)
+                if target_job:
+                    await db.contractor_jobs.update_one({'id': target_job['id']}, {
+                        '$set': {'is_urgent': True, 'priority': 'urgent', 'updated_at': now}
+                    })
+                    desc = payload.get('description') or 'Urgent flag received from Delivery Centre'
+                    await log_job_activity(
+                        db=db,
+                        job_id=target_job['id'],
+                        activity_type='issue_flag',
+                        author_id='delivery-centre',
+                        author_name='Delivery Centre Webhook',
+                        message=f"Urgent priority set from Delivery Centre: {desc}",
+                        created_at=now
+                    )
+                    try:
+                        await notify_urgent_issue_flagged(db, target_job['id'], desc)
+                    except Exception:
+                        pass
+                    processed_action = f'urgent_flagged:{target_job["id"]}'
+
+        # Log webhook result
+        sync_log = IntegrationSyncLog(
+            client_id=client_id,
+            direction='inbound_to_contractor',
+            event=event,
+            status='success',
+            details={'payload': payload, 'action': processed_action},
+            synced_at=now
+        )
+        await db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json'))
+        return {'received': True, 'event': event, 'action': processed_action}
+
+    except Exception as ex:
+        log.exception("Webhook processing error: %s", ex)
+        sync_log = IntegrationSyncLog(
+            client_id=client_id,
+            direction='inbound_to_contractor',
+            event=event,
+            status='failed',
+            error_message=str(ex),
+            details=payload,
+            synced_at=now
+        )
+        await db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json'))
+        return {'received': False, 'error': str(ex)}
+
+
+@router.post('/integrations/poll')
+async def trigger_manual_integration_poll(user: User = Depends(require_admin)):
+    """
+    Manually triggers the background 5-15 min scheduled polling sync from Delivery Centre.
+    """
+    db = get_db()
+    res = await poll_delivery_centre_integration(db)
+    return res
+
+
+@router.get('/integrations/config')
+async def get_integration_config(user: User = Depends(require_admin)):
+    """
+    Returns Delivery Centre integration settings and API credentials configuration.
+    """
+    db = get_db()
+    conf = await db.settings.find_one({'key': 'delivery_centre_integration'})
+    if not conf:
+        return {
+            'api_url': 'https://deliverycentre.goodshowroom.com',
+            'api_key': '',
+            'webhook_url': 'https://byd-panel.omnisuiteai.com/api/contractor/integrations/webhook',
+            'polling_interval_minutes': 10,
+            'auto_poll_enabled': True
+        }
+    return {
+        'api_url': conf.get('api_url', 'https://deliverycentre.goodshowroom.com'),
+        'api_key': conf.get('api_key', ''),
+        'webhook_url': conf.get('webhook_url', 'https://byd-panel.omnisuiteai.com/api/contractor/integrations/webhook'),
+        'polling_interval_minutes': conf.get('polling_interval_minutes', 10),
+        'auto_poll_enabled': conf.get('auto_poll_enabled', True)
+    }
+
+
+@router.post('/integrations/config')
+async def save_integration_config(request: Request, user: User = Depends(require_super)):
+    """
+    Saves Delivery Centre integration API configuration (Super Admin only).
+    """
+    db = get_db()
+    payload = await request.json()
+    now = datetime.now(timezone.utc)
+    data = {
+        'key': 'delivery_centre_integration',
+        'api_url': payload.get('api_url', 'https://deliverycentre.goodshowroom.com').strip(),
+        'api_key': payload.get('api_key', '').strip(),
+        'webhook_url': payload.get('webhook_url', '').strip(),
+        'polling_interval_minutes': int(payload.get('polling_interval_minutes', 10)),
+        'auto_poll_enabled': bool(payload.get('auto_poll_enabled', True)),
+        'updated_at': now,
+        'updated_by': user.name
+    }
+    await db.settings.update_one({'key': 'delivery_centre_integration'}, {'$set': data}, upsert=True)
+    return {'success': True, 'config': data}
 
 
 # ---------------------------------------------------------------------------

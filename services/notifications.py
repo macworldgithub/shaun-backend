@@ -193,11 +193,18 @@ async def scheduled_workflow_worker():
     while True:
         try:
             now = datetime.now(MELBOURNE)
+            db = get_db()
             await run_due_notifications(now)
             await refresh_catalogue_on_first_of_month(now)
             await poll_inbound_mail()
             if now.hour == 3:
                 await enforce_document_retention()
+            # Spec §6: Fallback scheduled polling (every 5-15 mins) for Delivery Centre two-way sync
+            try:
+                from services.contractor_service import poll_delivery_centre_integration
+                await poll_delivery_centre_integration(db)
+            except Exception as poll_ex:
+                log.warning('Delivery Centre integration polling encountered issue: %s', poll_ex)
         except asyncio.CancelledError:
             raise
         except Exception:

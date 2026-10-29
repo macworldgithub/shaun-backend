@@ -47,6 +47,7 @@ class JobTask(BaseModel):
     completed_by_id: Optional[str] = None
     completed_by_name: Optional[str] = None
     notes: Optional[str] = None
+    duration_seconds: int = 0
 
     @computed_field
     @property
@@ -137,7 +138,8 @@ class JobBase(BaseModel):
                 'completed_at': t.completed_at.isoformat() if t.completed_at else None,
                 'completed_by_id': t.completed_by_id,
                 'completed_by_name': t.completed_by_name,
-                'notes': t.notes
+                'notes': t.notes,
+                'duration_seconds': getattr(t, 'duration_seconds', 0)
             }
             for t in self.checklist
         ]
@@ -416,7 +418,8 @@ OfflineActionType = Literal[
     'location_checkin',
     'add_comment',
     'flag_issue',
-    'update_task'
+    'update_task',
+    'upload_evidence'
 ]
 
 
