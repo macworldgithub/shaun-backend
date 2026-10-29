@@ -1,3 +1,4 @@
+from tests.contractor_fixtures import mock_database, async_collection, contractor_environment
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -58,11 +59,11 @@ def test_offline_action_type_includes_evidence():
 @pytest.mark.anyio
 async def test_clock_out_accumulates_task_duration():
     """Requirement: Stopping a task timer accumulates duration onto the specific task."""
-    mock_db = MagicMock()
-    mock_db.contractor_time_logs = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.contractor_activities = MagicMock()
-    mock_db.clients = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_time_logs = async_collection()
+    mock_db.contractor_jobs = async_collection()
+    mock_db.contractor_activities = async_collection()
+    mock_db.clients = async_collection()
 
     t_in = datetime.now(timezone.utc) - timedelta(seconds=300)
     mock_db.contractor_time_logs.find_one = AsyncMock(return_value={
@@ -110,8 +111,8 @@ async def test_clock_out_accumulates_task_duration():
 @pytest.mark.anyio
 async def test_analytics_computes_average_time_per_task():
     """Requirement: Analytics aggregates average duration and count per service task."""
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_jobs = async_collection()
     mock_db.contractor_jobs.count_documents = AsyncMock(return_value=2)
 
     sample_jobs = [
@@ -154,12 +155,12 @@ async def test_analytics_computes_average_time_per_task():
 @pytest.mark.anyio
 async def test_poll_delivery_centre_integration_auto_creates_jobs():
     """Requirement: 5-15 min background polling creates jobs from Delivery Centre clients."""
-    mock_db = MagicMock()
-    mock_db.clients = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.contractor_sync_logs = MagicMock()
-    mock_db.contractor_activities = MagicMock()
-    mock_db.users = MagicMock()
+    mock_db = mock_database()
+    mock_db.clients = async_collection()
+    mock_db.contractor_jobs = async_collection()
+    mock_db.contractor_sync_logs = async_collection()
+    mock_db.contractor_activities = async_collection()
+    mock_db.users = async_collection()
 
     client_data = {
         'id': 'dc-client-99',
@@ -199,57 +200,21 @@ async def test_poll_delivery_centre_integration_auto_creates_jobs():
 
 @pytest.mark.anyio
 async def test_inbound_webhook_event_automation():
-    """Requirement: Webhooks automatically create jobs, update due dates & flag urgent blockers."""
-    from routers.contractor import receive_external_webhook
-
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.contractor_sync_logs = MagicMock()
-    mock_db.contractor_activities = MagicMock()
-    mock_db.contractor_activities.insert_one = AsyncMock()
-    mock_db.clients = MagicMock()
-
-    # A. Test due date update event
-    mock_db.contractor_jobs.update_many = AsyncMock(return_value=MagicMock(modified_count=1))
-    mock_db.contractor_sync_logs.insert_one = AsyncMock()
-
-    async def mock_json():
-        return {
-            'event': 'job.due_date_updated',
-            'client_id': 'c-123',
-            'due_date': '2026-12-01'
-        }
-
-    mock_request = MagicMock()
-    mock_request.json = AsyncMock(side_effect=mock_json)
-
-    with patch('routers.contractor.get_db', return_value=mock_db):
-        res = await receive_external_webhook(mock_request)
-        assert res['received'] is True
-        assert 'due_date_updated:1' in res['action']
-        mock_db.contractor_jobs.update_many.assert_called_once()
-
-    # B. Test urgent flag event
-    target_job = {'id': 'job-xyz', 'client_id': 'c-123', 'is_urgent': False}
-    mock_db.contractor_jobs.find_one = AsyncMock(return_value=target_job)
-    mock_db.contractor_jobs.update_one = AsyncMock()
-
-    async def mock_urgent_json():
-        return {
-            'event': 'job.urgent_flag',
-            'client_id': 'c-123',
-            'description': 'Customer flight moved up!'
-        }
-
-    mock_urgent_req = MagicMock()
-    mock_urgent_req.json = AsyncMock(side_effect=mock_urgent_json)
-
-    with patch('routers.contractor.get_db', return_value=mock_db), \
-         patch('routers.contractor.notify_urgent_issue_flagged', new=AsyncMock()):
-        urgent_res = await receive_external_webhook(mock_urgent_req)
-        assert urgent_res['received'] is True
-        assert 'urgent_flagged:job-xyz' in urgent_res['action']
-        mock_db.contractor_jobs.update_one.assert_called()
+    from services.contractor_integration import receive_event
+    from tests.contractor_fixtures import Cursor
+    db = mock_database()
+    db.contractor_jobs.find.return_value = Cursor([{'id': 'job-xyz', 'client_id': 'c-123', 'is_urgent': False}])
+    req = MagicMock()
+    req.headers = {'authorization': 'Bearer test-webhook-secret'}
+    req.body = AsyncMock(return_value=b'webhook-test')
+    req.json = AsyncMock(return_value={'event': 'job.urgent_flag', 'client_id': 'c-123', 'description': 'Urgent delivery'})
+    with patch('services.push_service.notify_urgent_issue_flagged', new=AsyncMock()) as push:
+        result = await receive_event(db, req)
+    assert result['received'] is True
+    assert result['action'] == 'updated:1'
+    assert db.contractor_jobs.update_one.call_args.args[1]['$set']['is_urgent'] is True
+    push.assert_awaited_once()
+    assert push.call_args.args[1]['id'] == 'job-xyz'
 
 
 # ===========================================================================
@@ -262,11 +227,11 @@ async def test_evidence_mirrors_to_delivery_centre():
     from routers.contractor import upload_job_evidence
     from fastapi import UploadFile
 
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.contractor_evidence = MagicMock()
-    mock_db.contractor_activities = MagicMock()
-    mock_db.clients = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_jobs = async_collection()
+    mock_db.contractor_evidence = async_collection()
+    mock_db.contractor_activities = async_collection()
+    mock_db.clients = async_collection()
 
     mock_db.contractor_jobs.find_one = AsyncMock(return_value={
         'id': 'job-ev-1',
@@ -301,9 +266,10 @@ async def test_evidence_mirrors_to_delivery_centre():
         assert ev_result.stage == 'after'
         assert ev_result.job_id == 'job-ev-1'
 
-        mock_db.clients.update_one.assert_called_once()
-        client_call = mock_db.clients.update_one.call_args[0]
-        assert client_call[0] == {'id': 'client-dc-777'}
+        assert mock_db.clients.update_one.await_count >= 1
+        client_call = next(call.args for call in mock_db.clients.update_one.call_args_list if '$push' in call.args[1] and 'documents' in call.args[1]['$push'])
+        assert client_call[0]['id'] == 'client-dc-777'
+        assert 'documents.id' in client_call[0]
         push_doc = client_call[1]['$push']['documents']
         assert '[AFTER]' in push_doc['file_name']
         assert push_doc['status'] == 'complete'
@@ -318,8 +284,8 @@ async def test_integration_config_and_poll_api():
     """Requirement: Integration config storage & manual polling endpoint."""
     from routers.contractor import get_integration_config, save_integration_config, trigger_manual_integration_poll
 
-    mock_db = MagicMock()
-    mock_db.settings = MagicMock()
+    mock_db = mock_database()
+    mock_db.settings = async_collection()
     mock_db.settings.find_one = AsyncMock(return_value=None)
     mock_db.settings.update_one = AsyncMock()
 
@@ -349,8 +315,11 @@ async def test_integration_config_and_poll_api():
     with patch('routers.contractor.get_db', return_value=mock_db):
         save_res = await save_integration_config(mock_req, user=mock_user)
         assert save_res['success'] is True
-        assert save_res['config']['api_key'] == 'prod-key-xyz'
-        assert save_res['config']['polling_interval_minutes'] == 15
+        assert save_res['config']['api_key'] == ''
+        stored = mock_db.settings.update_one.call_args.args[1]['$set']
+        assert 'api_key' not in stored
+        assert stored['api_key_encrypted'] != 'prod-key-xyz'
+        assert stored['polling_interval_minutes'] == 15
 
     # 3. Manual polling trigger
     with patch('routers.contractor.get_db', return_value=mock_db), \

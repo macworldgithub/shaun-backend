@@ -298,6 +298,7 @@ class OfferRecord(BaseModel):
 
 
 class Client(ClientBase):
+    contractor_jobs: dict = Field(default_factory=dict)
     model_config = ConfigDict(populate_by_name=True)
     id: str = Field(default_factory=_id)
     comments: List[Comment] = Field(default_factory=list)

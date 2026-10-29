@@ -1,4 +1,5 @@
 import os
+import asyncio
 import io
 import json
 import base64
@@ -159,7 +160,7 @@ async def send_web_push(
         if not sub_info:
             continue
         try:
-            webpush(
+            await asyncio.to_thread(webpush,
                 subscription_info=sub_info,
                 data=payload_json,
                 vapid_private_key=vapid,
@@ -186,25 +187,24 @@ async def broadcast_role_push(
     title: str,
     body: str,
     data: Optional[dict] = None,
-    tag: Optional[str] = None
+    tag: Optional[str] = None,
+    site: Optional[str] = None
 ) -> int:
     """Broadcasts a push notification to all users matching a role (e.g. 'admin' or 'super_admin')."""
     # Find all users with this role
     matching_users = []
-    async for u in db.users.find({'role': role}):
+    query = {'role': role, 'active': True, 'deleted_at': None}
+    if site:
+        from services.contractor_access import site_filter
+        match = site_filter(site)
+        query['$or'] = [{'locked_site': match}, {'locked_site': None, 'allowed_sites': match}, {'locked_site': None, 'all_sites': True}, {'locked_site': None, 'allowed_sites': None, 'active_site': match}]
+    async for u in db.users.find(query):
         matching_users.append(u.get('id') or str(u.get('_id')))
 
     total_sent = 0
     for uid in matching_users:
         sent = await send_web_push(db, uid, title, body, data=data, tag=tag)
         total_sent += sent
-
-    # Also check subscriptions directly registered with role
-    async for s in db.push_subscriptions.find({'role': role}):
-        uid = s.get('user_id')
-        if uid not in matching_users:
-            sent = await send_web_push(db, uid, title, body, data=data, tag=tag)
-            total_sent += sent
 
     return total_sent
 
@@ -229,7 +229,7 @@ async def notify_contractor_job_assigned(db, job: dict, contractor_id: str):
         user_id=contractor_id,
         title=title,
         body=body,
-        data={'job_id': job.get('id'), 'action': 'open_job'},
+        data={'job_id': job.get('id'), 'action': 'open_job', 'url': '/jobs/' + job.get('id', '')},
         tag=f"job-{job.get('id')}-assign"
     )
 
@@ -241,11 +241,13 @@ async def notify_urgent_issue_flagged(db, job: dict, description: str, reporter_
 
     title = f"🚨 Issue Flagged: {model_name} ({vin})"
     body = f"{reporter_name}: {description[:120]}"
-    data = {'job_id': job.get('id'), 'issue': True, 'action': 'open_job'}
+    data = {'job_id': job.get('id'), 'issue': True, 'action': 'open_job', 'url': '/jobs/' + job.get('id', '')}
 
+    if job.get('assigned_contractor_id'):
+        await send_web_push(db, job['assigned_contractor_id'], title, body, data=data, tag=f"issue-{job['id']}")
     # Broadcast to admins and super_admins
-    await broadcast_role_push(db, 'admin', title, body, data=data, tag=f"issue-{job.get('id')}")
-    await broadcast_role_push(db, 'super_admin', title, body, data=data, tag=f"issue-{job.get('id')}")
+    await broadcast_role_push(db, 'admin', title, body, data=data, tag=f"issue-{job.get('id')}", site=job.get('site_location'))
+    await broadcast_role_push(db, 'super_admin', title, body, data=data, tag=f"issue-{job.get('id')}", site=job.get('site_location'))
 
 
 async def notify_due_date_approaching(db, job: dict, days_left: int):
@@ -263,11 +265,12 @@ async def notify_due_date_approaching(db, job: dict, days_left: int):
         title = f"📅 Job Due in {days_left} Day(s): {model_name} ({vin})"
         body = f"Due: {job.get('due_date')} | Contractor: {job.get('assigned_contractor_name') or 'Unassigned'}"
 
-    data = {'job_id': job.get('id'), 'action': 'open_job'}
+    data = {'job_id': job.get('id'), 'action': 'open_job', 'url': '/jobs/' + job.get('id', '')}
     cid = job.get('assigned_contractor_id')
     if cid:
         await send_web_push(db, cid, title, body, data=data, tag=f"due-{job.get('id')}-{days_left}")
 
     # For overdue or due today, alert admins
     if days_left <= 0:
-        await broadcast_role_push(db, 'admin', title, body, data=data, tag=f"admin-due-{job.get('id')}-{days_left}")
+        for role in ('admin', 'super_admin'):
+            await broadcast_role_push(db, role, title, body, data=data, tag=f"admin-due-{job.get('id')}-{days_left}", site=job.get('site_location'))

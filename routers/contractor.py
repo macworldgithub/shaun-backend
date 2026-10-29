@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, Request, status
 from fastapi.responses import Response
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Annotated
 from datetime import datetime, timezone, timedelta
 import uuid
 import logging
@@ -24,7 +24,7 @@ from models import (
     ClientDocument
 )
 from auth import (
-    get_current_user, require_admin, require_super,
+    get_current_user, require_admin, require_super, effective_site, assert_site_access,
     require_contractor_or_admin
 )
 from services.storage import put_bytes, get_bytes, exists
@@ -54,6 +54,13 @@ from services.push_service import (
     notify_urgent_issue_flagged
 )
 
+from services.contractor_access import assert_job_access, job_scope, validate_assignment, site_filter
+from services.contractor_integration import authenticate_webhook, integration_config, save_config, queue_job_event, run_integration_worker
+
+async def _safe_dispatch(db, event, job_id, payload):
+    await queue_job_event(db, event, job_id, payload)
+
+
 router = APIRouter(prefix='/api/contractor', tags=['contractor'])
 
 
@@ -62,11 +69,16 @@ router = APIRouter(prefix='/api/contractor', tags=['contractor'])
 # ---------------------------------------------------------------------------
 
 @router.get('/contractors', response_model=List[User])
-async def list_contractors(_: User = Depends(require_contractor_or_admin)):
+async def list_contractors(user: User = Depends(require_admin)):
     """List available contractors for job assignment dropdowns."""
     db = get_db()
     out = []
-    async for d in db.users.find({'role': 'contractor', 'active': True}).sort('name', 1):
+    query = {'role': {'$in': ['contractor', 'admin', 'super_admin', 'site_admin']}, 'active': True, 'deleted_at': None}
+    site = effective_site(user)
+    if site:
+        match = site_filter(site)
+        query['$or'] = [{'locked_site': match}, {'locked_site': None, 'active_site': match}, {'locked_site': None, 'all_sites': True}, {'locked_site': None, 'allowed_sites': match}]
+    async for d in db.users.find(query).sort('name', 1):
         d.pop('password_hash', None)
         out.append(User(**_strip(d)))
     return out
@@ -81,6 +93,7 @@ async def list_jobs(
     status: Optional[str] = None,
     priority: Optional[str] = None,
     is_urgent: Optional[bool] = None,
+    issue_flag: Optional[bool] = None,
     model: Optional[str] = None,
     vin: Optional[str] = None,
     client_id: Optional[str] = None,
@@ -88,7 +101,7 @@ async def list_jobs(
     site: Optional[str] = None,
     limit: int = Query(200, le=1000),
     skip: int = Query(0, ge=0),
-    user: User = Depends(get_current_user)
+    user: User = Depends(require_contractor_or_admin)
 ):
     """
     List contractor jobs.
@@ -96,7 +109,7 @@ async def list_jobs(
     Admins/Super Admins see all jobs with rich filtering.
     """
     db = get_db()
-    query: Dict[str, Any] = {}
+    query: Dict[str, Any] = job_scope(user, site)
 
     if user.role == 'contractor':
         query['assigned_contractor_id'] = user.id
@@ -123,8 +136,8 @@ async def list_jobs(
             query['$and'] = [{'$or': vin_or}, {'$or': client_or}]
         else:
             query['$or'] = client_or
-    if site:
-        query['site_location'] = site
+    if issue_flag is not None:
+        query['issue_flag'] = issue_flag
 
     out = []
     async for doc in db.contractor_jobs.find(query).sort('created_at', -1).skip(skip).limit(limit):
@@ -135,7 +148,7 @@ async def list_jobs(
 @router.post('/jobs', response_model=Job, status_code=status.HTTP_201_CREATED)
 async def create_job(
     payload: JobCreate,
-    user: User = Depends(require_contractor_or_admin)
+    user: User = Depends(require_admin)
 ):
     """Create a new job card (modeled on Trello Kanban)."""
     db = get_db()
@@ -148,11 +161,8 @@ async def create_job(
             checklist_items.append(JobTask(title=t.title, notes=t.notes))
 
     # Lookup contractor name if assigned
-    contractor_name = None
-    if payload.assigned_contractor_id:
-        c_user = await db.users.find_one({'id': payload.assigned_contractor_id})
-        if c_user:
-            contractor_name = c_user.get('name')
+    site = effective_site(user, payload.site_location) or 'Fairfield'
+    contractor_name = await validate_assignment(db, user, payload.assigned_contractor_id, site)
 
     job_data = Job(
         client_id=payload.client_id,
@@ -168,7 +178,7 @@ async def create_job(
         status=payload.status or 'requested',
         assigned_contractor_id=payload.assigned_contractor_id,
         assigned_contractor_name=contractor_name,
-        site_location=payload.site_location or 'Fairfield',
+        site_location=site,
         bay_location=payload.bay_location,
         checklist=checklist_items,
         template_id=payload.template_id,
@@ -193,16 +203,16 @@ async def create_job(
         except Exception as pe:
             log.warning("Could not dispatch push notification on job create: %s", pe)
 
-    dispatch_contractor_webhook('job.created', job_data.id, job_data.model_dump(mode='json'))
+    await sync_job_to_delivery_client(db, job_data.id, user.name)
+    await _safe_dispatch(db, 'job.created', job_data.id, job_data.model_dump(mode='json'))
     return job_data
 
 
 @router.get('/jobs/{job_id}', response_model=Job)
-async def get_job(job_id: str, user: User = Depends(get_current_user)):
+async def get_job(job_id: str, user: User = Depends(require_contractor_or_admin)):
     db = get_db()
     job_doc = await db.contractor_jobs.find_one({'id': job_id})
-    if not job_doc:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job_doc)
 
     if user.role == 'contractor' and job_doc.get('assigned_contractor_id') != user.id:
         raise HTTPException(403, 'You can only view your assigned jobs')
@@ -218,22 +228,31 @@ async def update_job(
 ):
     db = get_db()
     existing = await db.contractor_jobs.find_one({'id': job_id})
-    if not existing:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, existing)
 
     if user.role == 'contractor' and existing.get('assigned_contractor_id') != user.id:
         raise HTTPException(403, 'Permission denied')
 
-    update_dict = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
-    
-    # If assigned_contractor_id changed, update contractor name
+    update_dict = payload.model_dump(exclude_unset=True, mode='json')
+    if user.role == 'contractor':
+        raise HTTPException(403, 'Only admins can edit job details or assignments')
+    if 'site_location' in update_dict:
+        assert_site_access(user, {'site_location': update_dict['site_location']})
+    if update_dict.get('full_vin'):
+        update_dict['full_vin'] = update_dict['full_vin'].strip().upper()
+        update_dict['last_6_vin'] = update_dict['full_vin'][-6:]
+    if 'is_urgent' in update_dict:
+        update_dict['priority'] = 'urgent' if update_dict['is_urgent'] else 'normal'
+    elif 'priority' in update_dict:
+        update_dict['is_urgent'] = update_dict['priority'] == 'urgent'
+    update_dict.pop('sync_status', None)
+    update_dict.pop('sync_error', None)
+    update_dict.pop('last_synced_at', None)
+    if 'status' in update_dict:
+        status_value = update_dict.pop('status')
+        await update_job_status(job_id, JobStatusUpdate(status=status_value), user)
     if 'assigned_contractor_id' in update_dict:
-        c_id = update_dict['assigned_contractor_id']
-        if c_id:
-            c_user = await db.users.find_one({'id': c_id})
-            update_dict['assigned_contractor_name'] = c_user.get('name') if c_user else None
-        else:
-            update_dict['assigned_contractor_name'] = None
+        update_dict['assigned_contractor_name'] = await validate_assignment(db, user, update_dict['assigned_contractor_id'], update_dict.get('site_location', existing.get('site_location')))
 
     update_dict['updated_at'] = datetime.now(timezone.utc)
 
@@ -259,15 +278,18 @@ async def update_job(
         except Exception as pe:
             log.warning("Could not dispatch push notification on job assignment: %s", pe)
 
+    await sync_job_to_delivery_client(db, job_id, user.name)
     return Job(**_strip(updated))
 
 
 @router.delete('/jobs/{job_id}')
-async def delete_job(job_id: str, _: User = Depends(require_admin)):
+async def delete_job(job_id: str, user: User = Depends(require_admin)):
     db = get_db()
+    assert_job_access(user, await db.contractor_jobs.find_one({'id': job_id}))
     res = await db.contractor_jobs.delete_one({'id': job_id})
     if res.deleted_count == 0:
         raise HTTPException(404, 'Job not found')
+    await log_job_activity(db, job_id, 'status_change', user.id, user.name, 'Job deleted by administrator')
     return {'success': True, 'job_id': job_id}
 
 
@@ -282,8 +304,7 @@ async def update_job_status(
     """
     db = get_db()
     existing = await db.contractor_jobs.find_one({'id': job_id})
-    if not existing:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, existing)
 
     if user.role == 'contractor' and existing.get('assigned_contractor_id') != user.id:
         raise HTTPException(403, 'Permission denied')
@@ -299,15 +320,15 @@ async def update_job_status(
     }
 
     # Record milestone timestamps
-    if payload.status == 'collected' and not existing.get('collected_at'):
+    if payload.status == 'collected' and existing.get('status') != payload.status:
         set_fields['collected_at'] = now
-    elif payload.status == 'in_progress' and not existing.get('in_progress_at'):
+    elif payload.status == 'in_progress' and existing.get('status') != payload.status:
         set_fields['in_progress_at'] = now
-    elif payload.status == 'returned' and not existing.get('returned_at'):
+    elif payload.status == 'returned' and existing.get('status') != payload.status:
         set_fields['returned_at'] = now
-    elif payload.status == 'completed' and not existing.get('completed_at'):
+    elif payload.status == 'completed' and existing.get('status') != payload.status:
         set_fields['completed_at'] = now
-    elif payload.status == 'invoiced' and not existing.get('invoiced_at'):
+    elif payload.status == 'invoiced' and existing.get('status') != payload.status:
         set_fields['invoiced_at'] = now
 
     updated = await db.contractor_jobs.find_one_and_update(
@@ -326,10 +347,9 @@ async def update_job_status(
         meta={'from': existing.get('status'), 'to': payload.status, 'notes': payload.notes}
     )
 
-    # Two-way sync back to delivery centre client
-    await sync_job_to_delivery_client(db, job_id, user.name)
-    dispatch_contractor_webhook('job.status_updated', job_id, {'status': payload.status})
+    await _safe_dispatch(db, 'job.status_updated', job_id, {'status': payload.status})
 
+    await sync_job_to_delivery_client(db, job_id, user.name)
     return Job(**_strip(updated))
 
 
@@ -343,8 +363,7 @@ async def update_job_task(
     """Mark task completed or edit task title/notes."""
     db = get_db()
     existing = await db.contractor_jobs.find_one({'id': job_id})
-    if not existing:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, existing)
 
     if user.role == 'contractor' and existing.get('assigned_contractor_id') != user.id:
         raise HTTPException(403, 'Permission denied')
@@ -389,9 +408,8 @@ async def update_job_task(
         meta={'task_id': task_id, 'completed': payload.completed}
     )
 
-    # Sync back to delivery client
-    await sync_job_to_delivery_client(db, job_id, user.name)
 
+    await sync_job_to_delivery_client(db, job_id, user.name)
     return Job(**_strip(updated))
 
 
@@ -399,13 +417,12 @@ async def update_job_task(
 async def add_job_task(
     job_id: str,
     payload: JobTaskCreate,
-    user: User = Depends(require_contractor_or_admin)
+    user: User = Depends(require_admin)
 ):
     """Add a new checklist task to a job."""
     db = get_db()
     existing = await db.contractor_jobs.find_one({'id': job_id})
-    if not existing:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, existing)
 
     new_task = JobTask(title=payload.title, notes=payload.notes)
     updated = await db.contractor_jobs.find_one_and_update(
@@ -426,6 +443,7 @@ async def add_job_task(
         message=f"Added checklist task '{payload.title}'"
     )
 
+    await sync_job_to_delivery_client(db, job_id, user.name)
     return Job(**_strip(updated))
 
 
@@ -434,7 +452,7 @@ async def add_job_task(
 # ---------------------------------------------------------------------------
 
 @router.get('/templates', response_model=List[JobTemplate])
-async def list_job_templates(_: User = Depends(get_current_user)):
+async def list_job_templates(_: User = Depends(require_contractor_or_admin)):
     db = get_db()
     out = []
     async for doc in db.contractor_job_templates.find().sort('name', 1):
@@ -445,7 +463,7 @@ async def list_job_templates(_: User = Depends(get_current_user)):
 @router.post('/templates', response_model=JobTemplate, status_code=status.HTTP_201_CREATED)
 async def create_job_template(
     payload: JobTemplateCreate,
-    _: User = Depends(require_admin)
+    user: User = Depends(require_admin)
 ):
     db = get_db()
     template = JobTemplate(
@@ -456,6 +474,7 @@ async def create_job_template(
         category=payload.category or 'General'
     )
     await db.contractor_job_templates.insert_one(template.model_dump(mode='json'))
+    await db.audit.insert_one({'id': uuid.uuid4().hex, 'actor_id': user.id, 'action': 'contractor.template.create', 'entity_id': template.id, 'created_at': datetime.now(timezone.utc)})
     return template
 
 
@@ -463,7 +482,7 @@ async def create_job_template(
 async def update_job_template(
     template_id: str,
     payload: JobTemplateUpdate,
-    _: User = Depends(require_admin)
+    user: User = Depends(require_admin)
 ):
     db = get_db()
     update_dict = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
@@ -476,22 +495,24 @@ async def update_job_template(
     )
     if not res:
         raise HTTPException(404, 'Template not found')
+    await db.audit.insert_one({'id': uuid.uuid4().hex, 'actor_id': user.id, 'action': 'contractor.template.update', 'entity_id': template_id, 'created_at': datetime.now(timezone.utc)})
     return JobTemplate(**_strip(res))
 
 
 @router.delete('/templates/{template_id}')
-async def delete_job_template(template_id: str, _: User = Depends(require_admin)):
+async def delete_job_template(template_id: str, user: User = Depends(require_admin)):
     db = get_db()
     res = await db.contractor_job_templates.delete_one({'id': template_id})
     if res.deleted_count == 0:
         raise HTTPException(404, 'Template not found')
+    await db.audit.insert_one({'id': uuid.uuid4().hex, 'actor_id': user.id, 'action': 'contractor.template.delete', 'entity_id': template_id, 'created_at': datetime.now(timezone.utc)})
     return {'success': True, 'template_id': template_id}
 
 
 @router.post('/jobs/from-template', response_model=Job, status_code=status.HTTP_201_CREATED)
 async def create_job_from_template(
     payload: JobFromTemplateRequest,
-    user: User = Depends(require_contractor_or_admin)
+    user: User = Depends(require_admin)
 ):
     """Instantiate a new job card pre-populated with tasks from a selected template."""
     db = get_db()
@@ -503,11 +524,8 @@ async def create_job_from_template(
     full_vin = payload.full_vin.strip().upper()
     last_6 = full_vin[-6:] if len(full_vin) >= 6 else full_vin
 
-    contractor_name = None
-    if payload.assigned_contractor_id:
-        c_user = await db.users.find_one({'id': payload.assigned_contractor_id})
-        if c_user:
-            contractor_name = c_user.get('name')
+    site = effective_site(user, payload.site_location) or 'Fairfield'
+    contractor_name = await validate_assignment(db, user, payload.assigned_contractor_id, site)
 
     job_data = Job(
         client_id=payload.client_id,
@@ -523,7 +541,7 @@ async def create_job_from_template(
         status='requested',
         assigned_contractor_id=payload.assigned_contractor_id,
         assigned_contractor_name=contractor_name,
-        site_location=payload.site_location or 'Fairfield',
+        site_location=site,
         bay_location=payload.bay_location,
         checklist=tasks,
         template_id=template.get('id'),
@@ -542,6 +560,9 @@ async def create_job_from_template(
         message=f"Job created from template '{template.get('name')}' with {len(tasks)} tasks"
     )
 
+    if job_data.assigned_contractor_id:
+        await notify_contractor_job_assigned(db, job_data.model_dump(mode='json'), job_data.assigned_contractor_id)
+    await sync_job_to_delivery_client(db, job_data.id, user.name)
     return job_data
 
 
@@ -558,8 +579,7 @@ async def clock_in(
     """One-click clock on per job or individual task."""
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     try:
         entry = await clock_in_contractor(
@@ -584,8 +604,7 @@ async def clock_out(
     """One-click clock off per job."""
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     try:
         entry = await clock_out_contractor(
@@ -601,11 +620,10 @@ async def clock_out(
 
 
 @router.get('/jobs/{job_id}/time-logs', response_model=List[JobTimeEntry])
-async def list_job_time_logs(job_id: str, user: User = Depends(get_current_user)):
+async def list_job_time_logs(job_id: str, user: User = Depends(require_contractor_or_admin)):
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     if user.role == 'contractor' and job.get('assigned_contractor_id') != user.id:
         raise HTTPException(403, 'Permission denied')
@@ -616,8 +634,15 @@ async def list_job_time_logs(job_id: str, user: User = Depends(get_current_user)
     return out
 
 
+@router.get('/time-logs')
+async def list_all_time_logs(skip: int = Query(0, ge=0), limit: int = Query(1000, ge=1, le=5000), user: User = Depends(require_admin)):
+    db = get_db()
+    ids = [j['id'] async for j in db.contractor_jobs.find(job_scope(user))]
+    return [JobTimeEntry(**_strip(doc)) async for doc in db.contractor_time_logs.find({'job_id': {'$in': ids}}).sort('clock_in', -1).skip(skip).limit(limit)]
+
+
 @router.get('/time-logs/active')
-async def get_active_clock_in(user: User = Depends(get_current_user)):
+async def get_active_clock_in(user: User = Depends(require_contractor_or_admin)):
     """Check if current user is currently clocked into any job."""
     db = get_db()
     doc = await db.contractor_time_logs.find_one({
@@ -626,8 +651,9 @@ async def get_active_clock_in(user: User = Depends(get_current_user)):
     })
     if not doc:
         return {'is_clocked_in': False, 'entry': None}
-    
+
     job_doc = await db.contractor_jobs.find_one({'id': doc.get('job_id')})
+    assert_job_access(user, job_doc)
     return {
         'is_clocked_in': True,
         'entry': JobTimeEntry(**_strip(doc)),
@@ -645,30 +671,49 @@ async def upload_job_evidence(
     stage: str = Form('before'),  # 'before', 'during', 'after', 'issue'
     caption: Optional[str] = Form(None),
     file: UploadFile = File(...),
+    client_action_id: Annotated[Optional[str], Form()] = None,
+    captured_at: Annotated[Optional[str], Form()] = None,
     user: User = Depends(require_contractor_or_admin)
 ):
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     if stage not in ('before', 'during', 'after', 'issue'):
         raise HTTPException(400, 'Stage must be before, during, after, or issue')
 
-    file_bytes = await file.read()
+    if client_action_id:
+        previous = await db.contractor_evidence.find_one({'job_id': job_id, 'client_action_id': client_action_id, 'uploaded_by_id': user.id})
+        if previous:
+            from services.contractor_evidence import mirror_evidence
+            evidence = JobEvidence(**_strip(previous))
+            await mirror_evidence(db, job, evidence, user.name)
+            await sync_job_to_delivery_client(db, job_id, user.name)
+            return evidence
+    import os
+    max_size = int(os.environ.get('CONTRACTOR_MAX_MEDIA_BYTES', 104857600))
+    file_bytes = await file.read(max_size + 1)
+    if len(file_bytes) > max_size:
+        raise HTTPException(413, 'Media exceeds the upload size limit')
     if not file_bytes:
         raise HTTPException(400, 'Uploaded file is empty')
 
     content_type = file.content_type or 'application/octet-stream'
+    allowed_types = {'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif', 'video/mp4', 'video/webm', 'video/quicktime', 'video/3gpp'}
+    if content_type not in allowed_types:
+        raise HTTPException(415, 'Upload a supported image or video')
     media_type = 'video' if content_type.startswith('video/') else 'image'
 
-    fname = file.filename or f'evidence-{uuid.uuid4().hex[:8]}.jpg'
-    storage_path = f"contractor-jobs/{job_id}/{uuid.uuid4().hex[:12]}-{fname}"
+    from pathlib import PurePath
+    fname = PurePath((file.filename or 'evidence.jpg').replace('\\', '/')).name
+    fname = fname or f'evidence-{uuid.uuid4().hex[:8]}.jpg'
+    evidence_id = str(uuid.uuid5(uuid.NAMESPACE_URL, user.id + ':' + job_id + ':' + client_action_id)) if client_action_id else str(uuid.uuid4())
+    storage_path = f"contractor-jobs/{job_id}/{evidence_id}-{fname}"
 
     await put_bytes(storage_path, file_bytes, content_type)
 
     evidence = JobEvidence(
-        job_id=job_id,
+        id=evidence_id, job_id=job_id,
         stage=stage,
         media_type=media_type,
         file_name=fname,
@@ -680,7 +725,17 @@ async def upload_job_evidence(
         uploaded_by_name=user.name
     )
 
-    await db.contractor_evidence.insert_one(evidence.model_dump(mode='json'))
+    from services.contractor_reporting import parse_date
+    if captured_at:
+        stamp = parse_date(captured_at)
+        if not stamp or stamp > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise HTTPException(400, 'Invalid capture time')
+        evidence.captured_at = stamp
+    evidence_doc = evidence.model_dump(mode='json')
+    evidence_doc['_id'] = evidence.id
+    if client_action_id:
+        evidence_doc['client_action_id'] = client_action_id
+    await db.contractor_evidence.insert_one(evidence_doc)
 
     await log_job_activity(
         db=db,
@@ -692,42 +747,18 @@ async def upload_job_evidence(
         meta={'evidence_id': evidence.id, 'stage': stage}
     )
 
-    # Mirror evidence directly to Delivery Centre client documents if linked
-    client_id = job.get('client_id') or job.get('dc_job_id')
-    if client_id and hasattr(db, 'clients'):
-        try:
-            client_doc = ClientDocument(
-                id=evidence.id,
-                client_id=client_id,
-                document_type='Other',
-                status='complete',
-                file_name=f"[{stage.upper()}] {fname}",
-                source='staff-upload',
-                uploaded_by=user.name,
-                storage_path=storage_path,
-                content_type=content_type,
-                size_bytes=len(file_bytes),
-                notes=f"Contractor evidence ({stage.capitalize()}): {caption or 'Uploaded via Contractor App'}"
-            )
-            await db.clients.update_one(
-                {'id': client_id},
-                {
-                    '$push': {'documents': client_doc.model_dump(mode='json')},
-                    '$set': {'updated_at': datetime.now(timezone.utc)}
-                }
-            )
-        except Exception as doc_err:
-            log.warning("Could not mirror evidence to client %s documents: %s", client_id, doc_err)
+    from services.contractor_evidence import mirror_evidence
+    await mirror_evidence(db, job, evidence, user.name)
 
+    await sync_job_to_delivery_client(db, job_id, user.name)
     return evidence
 
 
 @router.get('/jobs/{job_id}/evidence', response_model=List[JobEvidence])
-async def list_job_evidence(job_id: str, user: User = Depends(get_current_user)):
+async def list_job_evidence(job_id: str, user: User = Depends(require_contractor_or_admin)):
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     out = []
     async for doc in db.contractor_evidence.find({'job_id': job_id}).sort('captured_at', 1):
@@ -739,9 +770,10 @@ async def list_job_evidence(job_id: str, user: User = Depends(get_current_user))
 async def download_job_evidence(
     job_id: str,
     evidence_id: str,
-    _: User = Depends(get_current_user)
+    user: User = Depends(require_contractor_or_admin)
 ):
     db = get_db()
+    assert_job_access(user, await db.contractor_jobs.find_one({'id': job_id}))
     doc = await db.contractor_evidence.find_one({'id': evidence_id, 'job_id': job_id})
     if not doc or not doc.get('storage_path'):
         raise HTTPException(404, 'Evidence not found')
@@ -753,7 +785,7 @@ async def download_job_evidence(
     return Response(
         content=data,
         media_type=doc.get('content_type') or 'application/octet-stream',
-        headers={'Content-Disposition': f'inline; filename="{doc.get("file_name")}"'}
+        headers={'Content-Disposition': f'inline; filename="{doc.get("file_name")}"', 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff'}
     )
 
 
@@ -770,8 +802,7 @@ async def check_in_location(
     """GPS vehicle check-in and yard movement tracking."""
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     entry = await register_vehicle_location(
         db=db,
@@ -788,11 +819,10 @@ async def check_in_location(
 
 
 @router.get('/jobs/{job_id}/location-history', response_model=List[JobLocationEntry])
-async def get_location_history(job_id: str, _: User = Depends(get_current_user)):
+async def get_location_history(job_id: str, user: User = Depends(require_contractor_or_admin)):
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     out = []
     async for doc in db.contractor_locations.find({'job_id': job_id}).sort('recorded_at', -1):
@@ -805,11 +835,10 @@ async def get_location_history(job_id: str, _: User = Depends(get_current_user))
 # ---------------------------------------------------------------------------
 
 @router.get('/jobs/{job_id}/activity', response_model=List[JobActivity])
-async def get_job_activity(job_id: str, _: User = Depends(get_current_user)):
+async def get_job_activity(job_id: str, user: User = Depends(require_contractor_or_admin)):
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     out = []
     async for doc in db.contractor_activities.find({'job_id': job_id}).sort('created_at', -1):
@@ -825,8 +854,7 @@ async def add_job_comment(
 ):
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     activity = await log_job_activity(
         db=db,
@@ -851,8 +879,7 @@ async def flag_job_issue(
     """
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     now = datetime.now(timezone.utc)
     updated = await db.contractor_jobs.find_one_and_update(
@@ -901,11 +928,12 @@ async def flag_job_issue(
             {'$push': {'comments': client_comment}}
         )
 
-    dispatch_contractor_webhook('job.issue_flagged', job_id, {
+    await _safe_dispatch(db, 'job.issue_flagged', job_id, {
         'description': payload.description,
         'reported_by': user.name
     })
 
+    await sync_job_to_delivery_client(db, job_id, user.name)
     return Job(**_strip(updated))
 
 
@@ -918,8 +946,7 @@ async def resolve_job_issue(
     """Admin resolves a previously flagged issue."""
     db = get_db()
     job = await db.contractor_jobs.find_one({'id': job_id})
-    if not job:
-        raise HTTPException(404, 'Job not found')
+    assert_job_access(user, job)
 
     now = datetime.now(timezone.utc)
     updated = await db.contractor_jobs.find_one_and_update(
@@ -942,6 +969,7 @@ async def resolve_job_issue(
         message=f"Issue resolved by {user.name}. Resolution note: {notes or 'None'}"
     )
 
+    await sync_job_to_delivery_client(db, job_id, user.name)
     return Job(**_strip(updated))
 
 
@@ -950,52 +978,34 @@ async def resolve_job_issue(
 # ---------------------------------------------------------------------------
 
 @router.get('/dashboard')
-async def contractor_dashboard(user: User = Depends(get_current_user)):
-    """
-    Summary dashboard metrics.
-    For Contractors: filtered to their workload.
-    For Admins: full team pipeline overview.
-    """
+async def contractor_dashboard(user: User = Depends(require_contractor_or_admin)):
+    from services.contractor_reporting import parse_date, MELBOURNE
     db = get_db()
-    base_query: Dict[str, Any] = {}
-    if user.role == 'contractor':
-        base_query['assigned_contractor_id'] = user.id
-
-    # Pipeline counts
-    pipeline = {}
-    for st in ['requested', 'collected', 'in_progress', 'returned', 'completed', 'invoiced']:
-        count = await db.contractor_jobs.count_documents({**base_query, 'status': st})
-        pipeline[st] = count
-
-    total_jobs = await db.contractor_jobs.count_documents(base_query)
-    urgent_jobs = await db.contractor_jobs.count_documents({**base_query, 'is_urgent': True})
-    flagged_issues = await db.contractor_jobs.count_documents({**base_query, 'issue_flag': True})
-
-    today_iso = datetime.now(timezone.utc).date().isoformat()
-    overdue_jobs = await db.contractor_jobs.count_documents({
-        **base_query,
-        'due_date': {'$lt': today_iso},
-        'status': {'$nin': ['completed', 'invoiced']}
-    })
-
-    # Recent active time logs
-    active_logs = await db.contractor_time_logs.count_documents({'clock_out': None})
-
-    # Recent activity
-    recent_activity = []
-    async for doc in db.contractor_activities.find().sort('created_at', -1).limit(6):
-        recent_activity.append(_strip(doc))
-
-    return {
-        'role': user.role,
-        'total_jobs': total_jobs,
-        'pipeline': pipeline,
-        'urgent_jobs_count': urgent_jobs,
-        'flagged_issues_count': flagged_issues,
-        'overdue_jobs_count': overdue_jobs,
-        'active_clocked_in_count': active_logs,
-        'recent_activity': recent_activity
-    }
+    query = job_scope(user)
+    jobs = [doc async for doc in db.contractor_jobs.find(query)]
+    ids = [job['id'] for job in jobs]
+    pipeline = {key: sum(j.get('status') == key for j in jobs) for key in ('requested', 'collected', 'in_progress', 'returned', 'completed', 'invoiced')}
+    today = datetime.now(MELBOURNE).date()
+    urgent = sum(bool(j.get('is_urgent')) for j in jobs)
+    flagged = sum(bool(j.get('issue_flag')) for j in jobs)
+    overdue = sum(1 for j in jobs if parse_date(j.get('due_date')) and parse_date(j['due_date']).astimezone(MELBOURNE).date() < today and j.get('status') not in ('completed', 'invoiced'))
+    timed = [j.get('total_time_seconds', 0) for j in jobs if j.get('total_time_seconds', 0) > 0]
+    activity = [_strip(doc) async for doc in db.contractor_activities.find({'job_id': {'$in': ids}}).sort('created_at', -1).limit(6)]
+    workload = {}
+    for job in jobs:
+        name = job.get('assigned_contractor_name') or 'Unassigned'
+        workload[name] = workload.get(name, 0) + (job.get('status') not in ('completed', 'invoiced'))
+    oldest = sorted([j for j in jobs if j.get('status') not in ('completed', 'invoiced')], key=lambda j: parse_date(j.get('updated_at')) or datetime.now(timezone.utc))[:8]
+    return {'role': user.role, 'total_jobs': len(jobs), 'pipeline': pipeline,
+        'in_progress_jobs': pipeline['in_progress'], 'urgent_jobs': urgent, 'urgent_jobs_count': urgent,
+        'flagged_jobs': flagged, 'flagged_issues_count': flagged, 'escalated_jobs': sum(1 for j in jobs if j.get('is_urgent') or j.get('issue_flag')), 'overdue_jobs': overdue, 'overdue_jobs_count': overdue,
+        'completed_today': sum(1 for j in jobs if j.get('status') in ('completed', 'invoiced') and parse_date(j.get('completed_at')) and parse_date(j['completed_at']).astimezone(MELBOURNE).date() == today),
+        'active_contractors': len({j['assigned_contractor_id'] for j in jobs if j.get('assigned_contractor_id') and j.get('status') not in ('completed', 'invoiced')}),
+        'avg_time_per_job_seconds': sum(timed) / len(timed) if timed else 0,
+        'active_clocked_in_count': await db.contractor_time_logs.count_documents({'job_id': {'$in': ids}, 'clock_out': None}),
+        'recent_activity': activity, 'team_workload': workload,
+        'personal_jobs': [Job(**_strip(j)) for j in jobs if j.get('assigned_contractor_id') == user.id and j.get('status') not in ('completed', 'invoiced')],
+        'bottlenecks': [Job(**_strip(j)) for j in oldest]}
 
 
 @router.get('/analytics')
@@ -1004,6 +1014,7 @@ async def contractor_analytics(
     date_to: Optional[str] = None,
     contractor_id: Optional[str] = None,
     model: Optional[str] = None,
+    status: Optional[str] = None,
     user: User = Depends(require_admin)
 ):
     """Reporting and analytics engine."""
@@ -1013,7 +1024,7 @@ async def contractor_analytics(
         date_from=date_from,
         date_to=date_to,
         contractor_id=contractor_id,
-        model=model
+        model=model, status=status, site=effective_site(user)
     )
 
 
@@ -1025,6 +1036,10 @@ async def contractor_analytics(
 async def export_jobs(
     format: Optional[str] = Query('csv', pattern='^(csv|xlsx|excel|pdf)$'),
     contractor_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    model: Optional[str] = None,
+    status: Optional[str] = None,
     user: User = Depends(require_admin)
 ):
     """
@@ -1034,21 +1049,21 @@ async def export_jobs(
     db = get_db()
     fmt = (format or 'csv').lower()
     if fmt in ('xlsx', 'excel'):
-        content = await generate_contractor_jobs_xlsx(db, contractor_id)
+        content = await generate_contractor_jobs_xlsx(db, contractor_id, date_from=date_from, date_to=date_to, model=model, status=status, site=effective_site(user))
         return Response(
             content=content,
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             headers={'Content-Disposition': 'attachment; filename="contractor-jobs.xlsx"'}
         )
     elif fmt == 'pdf':
-        content = await generate_contractor_jobs_pdf(db, contractor_id)
+        content = await generate_contractor_jobs_pdf(db, contractor_id, date_from=date_from, date_to=date_to, model=model, status=status, site=effective_site(user))
         return Response(
             content=content,
             media_type='application/pdf',
             headers={'Content-Disposition': 'attachment; filename="contractor-jobs.pdf"'}
         )
     else:
-        csv_data = await generate_contractor_jobs_csv(db, contractor_id)
+        csv_data = await generate_contractor_jobs_csv(db, contractor_id, date_from=date_from, date_to=date_to, model=model, status=status, site=effective_site(user))
         return Response(
             content=csv_data,
             media_type='text/csv',
@@ -1059,11 +1074,15 @@ async def export_jobs(
 @router.get('/export/xlsx')
 async def export_jobs_xlsx(
     contractor_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    model: Optional[str] = None,
+    status: Optional[str] = None,
     user: User = Depends(require_admin)
 ):
     """Export jobs and time tracking records as an Excel (.xlsx) workbook."""
     db = get_db()
-    content = await generate_contractor_jobs_xlsx(db, contractor_id)
+    content = await generate_contractor_jobs_xlsx(db, contractor_id, date_from=date_from, date_to=date_to, model=model, status=status, site=effective_site(user))
     return Response(
         content=content,
         media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -1074,11 +1093,15 @@ async def export_jobs_xlsx(
 @router.get('/export/pdf')
 async def export_jobs_pdf(
     contractor_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    model: Optional[str] = None,
+    status: Optional[str] = None,
     user: User = Depends(require_admin)
 ):
     """Export jobs and time tracking records as a formatted PDF report."""
     db = get_db()
-    content = await generate_contractor_jobs_pdf(db, contractor_id)
+    content = await generate_contractor_jobs_pdf(db, contractor_id, date_from=date_from, date_to=date_to, model=model, status=status, site=effective_site(user))
     return Response(
         content=content,
         media_type='application/pdf',
@@ -1100,6 +1123,9 @@ async def bulk_import_jobs(
     Validates job records, expands templates, and triggers notifications.
     """
     db = get_db()
+    for item in payload.jobs:
+        item.site_location = effective_site(user, item.site_location) or 'Fairfield'
+        await validate_assignment(db, user, item.assigned_contractor_id, item.site_location)
     return await bulk_import_contractor_jobs(
         db=db,
         user=user,
@@ -1170,6 +1196,8 @@ async def trigger_sync_to_client(
     Outbound integration trigger: Synchronizes Contractor Job status & completed tasks to Client.
     """
     db = get_db()
+    assert_job_access(user, await db.contractor_jobs.find_one({'id': job_id}))
+    await db.contractor_outbox.update_many({'job_id': job_id, 'status': 'retry'}, {'$set': {'next_attempt_at': datetime.now(timezone.utc)}})
     res = await sync_job_to_delivery_client(db, job_id, user.name)
     if not res:
         raise HTTPException(404, 'Job not found or not linked to any Delivery Centre client')
@@ -1177,28 +1205,32 @@ async def trigger_sync_to_client(
 
 
 @router.get('/integrations/sync-status')
-async def get_sync_status(_: User = Depends(require_admin)):
+async def get_sync_status(user: User = Depends(require_admin)):
     """
     Sync dashboard showing integration health, API uptime status, error rates, data volume, and sync history.
     Spec §6: API uptime, error rates, data volume.
     """
     db = get_db()
-    total_syncs = await db.contractor_sync_logs.count_documents({})
-    success_syncs = await db.contractor_sync_logs.count_documents({'status': 'success'})
-    failed_syncs = await db.contractor_sync_logs.count_documents({'status': 'failed'})
+    scope = {}
+    if effective_site(user):
+        ids = [j['id'] async for j in db.contractor_jobs.find(job_scope(user))]
+        scope = {'job_id': {'$in': ids}}
+    total_syncs = await db.contractor_sync_logs.count_documents(scope)
+    success_syncs = await db.contractor_sync_logs.count_documents({**scope, 'status': 'success'})
+    failed_syncs = await db.contractor_sync_logs.count_documents({**scope, 'status': 'failed'})
 
     now = datetime.now(timezone.utc)
     one_day_ago = now - timedelta(days=1)
     seven_days_ago = now - timedelta(days=7)
 
-    volume_24h = await db.contractor_sync_logs.count_documents({'synced_at': {'$gte': one_day_ago}})
-    volume_7d = await db.contractor_sync_logs.count_documents({'synced_at': {'$gte': seven_days_ago}})
+    volume_24h = await db.contractor_sync_logs.count_documents({**scope, 'synced_at': {'$gte': one_day_ago}})
+    volume_7d = await db.contractor_sync_logs.count_documents({**scope, 'synced_at': {'$gte': seven_days_ago}})
 
     error_rate = round((failed_syncs / total_syncs * 100), 2) if total_syncs > 0 else 0.0
 
     recent_logs = []
     last_sync_at = None
-    async for doc in db.contractor_sync_logs.find().sort('synced_at', -1).limit(20):
+    async for doc in db.contractor_sync_logs.find(scope).sort('synced_at', -1).limit(20):
         if last_sync_at is None:
             last_sync_at = doc.get('synced_at')
         recent_logs.append(_strip(doc))
@@ -1213,7 +1245,13 @@ async def get_sync_status(_: User = Depends(require_admin)):
         health_status = 'Critical'
         uptime_status = 'Degraded Service'
 
+    config = await integration_config(db)
+    probe = await db.settings.find_one({'key': 'contractor_integration_health'}) or {}
     return {
+        'outbound_configured': bool(config['outbound_webhook_url']),
+        'last_health_check': probe.get('checked_at'),
+        'remote_reachable': probe.get('reachable'),
+        'pending_outbound': await db.contractor_outbox.count_documents({**scope, 'status': {'$in': ['pending', 'retry', 'sending']}}),
         'total_sync_events': total_syncs,
         'success_count': success_syncs,
         'failed_count': failed_syncs,
@@ -1222,115 +1260,33 @@ async def get_sync_status(_: User = Depends(require_admin)):
         'data_volume_7d': volume_7d,
         'last_sync_at': last_sync_at,
         'health': health_status,
-        'uptime_status': uptime_status,
+        'uptime_status': ('Shared database' if not config['api_url'] else ('Operational' if probe.get('reachable') else 'Unreachable' if probe.get('reachable') is False else 'Not checked')),
         'recent_logs': recent_logs
     }
 
 
+@router.get('/integrations/requests')
+async def integration_requests(request: Request, skip: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=1000)):
+    db = get_db()
+    await authenticate_webhook(request, db)
+    docs = [doc async for doc in db.clients.find({'stage': {'$nin': ['Delivered', 'Cancelled']}}).sort('id', 1).skip(skip).limit(limit + 1)]
+    requests = []
+    for client in docs[:limit]:
+        vin = client.get('vin')
+        if not vin:
+            continue
+        requests.append({'client_id': client['id'], 'dc_job_id': client['id'], 'model_name': client.get('vehicle') or 'BYD Vehicle',
+            'full_vin': vin, 'last_6_vin': vin[-6:], 'delivery_date_time': client.get('delivery_date'), 'due_date': client.get('delivery_date'),
+            'description': client.get('notes'), 'priority': 'urgent' if client.get('alert') else 'normal', 'is_urgent': bool(client.get('alert')),
+            'site_location': client.get('site_location') or 'Fairfield',
+            'checklist': [JobTask(title='Fit ' + a['name']).model_dump(mode='json') for a in client.get('accessories', []) if a.get('name')]})
+    return {'requests': requests, 'next_skip': skip + limit if len(docs) > limit else None}
+
+
 @router.post('/integrations/webhook')
 async def receive_external_webhook(request: Request):
-    """
-    Receives incoming webhooks from Delivery Centre events with automatic job actions:
-    - client.created / job.request / accessory.added: Auto-creates job
-    - job.due_date_updated / due_date.updated: Updates due date
-    - job.urgent_flag / urgent.flagged: Flags job as urgent & sends push alert
-    - job.updated / client.updated: Synchronizes changes
-    """
-    db = get_db()
-    payload = await request.json()
-    event = payload.get('event') or 'webhook.received'
-    client_id = payload.get('client_id')
-    vin = payload.get('vin') or payload.get('full_vin')
-    now = datetime.now(timezone.utc)
-    processed_action = 'logged'
-
-    log.info("Received integration webhook: event=%s, client_id=%s, vin=%s", event, client_id, vin)
-
-    try:
-        # 1. Job Creation / New Request
-        if event in ('client.created', 'job.request', 'delivery.scheduled', 'accessory.added') and client_id:
-            existing_job = await db.contractor_jobs.find_one({
-                '$or': [{'client_id': client_id}, {'dc_job_id': client_id}]
-            })
-            if not existing_job:
-                new_job = await create_job_from_delivery_client(
-                    db=db,
-                    client_id=client_id,
-                    due_date=payload.get('due_date') or payload.get('delivery_date'),
-                    is_urgent=bool(payload.get('is_urgent', False))
-                )
-                processed_action = f'job_created:{new_job.id}'
-            else:
-                processed_action = f'job_already_exists:{existing_job["id"]}'
-
-        # 2. Due Date Updated
-        elif event in ('job.due_date_updated', 'due_date.updated', 'delivery_date.updated'):
-            new_due = payload.get('due_date') or payload.get('delivery_date')
-            if new_due and (client_id or vin):
-                q = {'$or': []}
-                if client_id:
-                    q['$or'].extend([{'client_id': client_id}, {'dc_job_id': client_id}])
-                if vin:
-                    q['$or'].append({'full_vin': vin})
-                res = await db.contractor_jobs.update_many(q, {
-                    '$set': {'due_date': new_due, 'delivery_date_time': new_due, 'updated_at': now, 'last_synced_at': now}
-                })
-                processed_action = f'due_date_updated:{res.modified_count}'
-
-        # 3. Urgent Flagged
-        elif event in ('job.urgent_flag', 'urgent.flagged', 'priority.urgent'):
-            q = {'$or': []}
-            if client_id:
-                q['$or'].extend([{'client_id': client_id}, {'dc_job_id': client_id}])
-            if vin:
-                q['$or'].append({'full_vin': vin})
-            if q['$or']:
-                target_job = await db.contractor_jobs.find_one(q)
-                if target_job:
-                    await db.contractor_jobs.update_one({'id': target_job['id']}, {
-                        '$set': {'is_urgent': True, 'priority': 'urgent', 'updated_at': now}
-                    })
-                    desc = payload.get('description') or 'Urgent flag received from Delivery Centre'
-                    await log_job_activity(
-                        db=db,
-                        job_id=target_job['id'],
-                        activity_type='issue_flag',
-                        author_id='delivery-centre',
-                        author_name='Delivery Centre Webhook',
-                        message=f"Urgent priority set from Delivery Centre: {desc}",
-                        created_at=now
-                    )
-                    try:
-                        await notify_urgent_issue_flagged(db, target_job['id'], desc)
-                    except Exception:
-                        pass
-                    processed_action = f'urgent_flagged:{target_job["id"]}'
-
-        # Log webhook result
-        sync_log = IntegrationSyncLog(
-            client_id=client_id,
-            direction='inbound_to_contractor',
-            event=event,
-            status='success',
-            details={'payload': payload, 'action': processed_action},
-            synced_at=now
-        )
-        await db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json'))
-        return {'received': True, 'event': event, 'action': processed_action}
-
-    except Exception as ex:
-        log.exception("Webhook processing error: %s", ex)
-        sync_log = IntegrationSyncLog(
-            client_id=client_id,
-            direction='inbound_to_contractor',
-            event=event,
-            status='failed',
-            error_message=str(ex),
-            details=payload,
-            synced_at=now
-        )
-        await db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json'))
-        return {'received': False, 'error': str(ex)}
+    from services.contractor_integration import receive_event
+    return await receive_event(get_db(), request)
 
 
 @router.post('/integrations/poll')
@@ -1339,54 +1295,19 @@ async def trigger_manual_integration_poll(user: User = Depends(require_admin)):
     Manually triggers the background 5-15 min scheduled polling sync from Delivery Centre.
     """
     db = get_db()
-    res = await poll_delivery_centre_integration(db)
+    await db.audit.insert_one({'id': uuid.uuid4().hex, 'actor_id': user.id, 'action': 'contractor.integration.manual_poll', 'created_at': datetime.now(timezone.utc)})
+    res = await poll_delivery_centre_integration(db, site=effective_site(user))
     return res
 
 
 @router.get('/integrations/config')
-async def get_integration_config(user: User = Depends(require_admin)):
-    """
-    Returns Delivery Centre integration settings and API credentials configuration.
-    """
-    db = get_db()
-    conf = await db.settings.find_one({'key': 'delivery_centre_integration'})
-    if not conf:
-        return {
-            'api_url': 'https://deliverycentre.goodshowroom.com',
-            'api_key': '',
-            'webhook_url': 'https://byd-panel.omnisuiteai.com/api/contractor/integrations/webhook',
-            'polling_interval_minutes': 10,
-            'auto_poll_enabled': True
-        }
-    return {
-        'api_url': conf.get('api_url', 'https://deliverycentre.goodshowroom.com'),
-        'api_key': conf.get('api_key', ''),
-        'webhook_url': conf.get('webhook_url', 'https://byd-panel.omnisuiteai.com/api/contractor/integrations/webhook'),
-        'polling_interval_minutes': conf.get('polling_interval_minutes', 10),
-        'auto_poll_enabled': conf.get('auto_poll_enabled', True)
-    }
+async def get_integration_config(user: User = Depends(require_super)):
+    return await integration_config(get_db(), public=True)
 
 
 @router.post('/integrations/config')
 async def save_integration_config(request: Request, user: User = Depends(require_super)):
-    """
-    Saves Delivery Centre integration API configuration (Super Admin only).
-    """
-    db = get_db()
-    payload = await request.json()
-    now = datetime.now(timezone.utc)
-    data = {
-        'key': 'delivery_centre_integration',
-        'api_url': payload.get('api_url', 'https://deliverycentre.goodshowroom.com').strip(),
-        'api_key': payload.get('api_key', '').strip(),
-        'webhook_url': payload.get('webhook_url', '').strip(),
-        'polling_interval_minutes': int(payload.get('polling_interval_minutes', 10)),
-        'auto_poll_enabled': bool(payload.get('auto_poll_enabled', True)),
-        'updated_at': now,
-        'updated_by': user.name
-    }
-    await db.settings.update_one({'key': 'delivery_centre_integration'}, {'$set': data}, upsert=True)
-    return {'success': True, 'config': data}
+    return await save_config(get_db(), await request.json(), user)
 
 
 # ---------------------------------------------------------------------------
@@ -1394,7 +1315,7 @@ async def save_integration_config(request: Request, user: User = Depends(require
 # ---------------------------------------------------------------------------
 
 @router.get('/push/vapid-public-key')
-async def get_push_public_key(_: User = Depends(get_current_user)):
+async def get_push_public_key(_: User = Depends(require_contractor_or_admin)):
     """Returns VAPID public key for frontend PWA push subscription."""
     db = get_db()
     public_key = await get_vapid_public_key(db)
@@ -1404,7 +1325,7 @@ async def get_push_public_key(_: User = Depends(get_current_user)):
 @router.post('/push/subscribe')
 async def subscribe_push_notifications(
     payload: PushSubscriptionPayload,
-    user: User = Depends(get_current_user)
+    user: User = Depends(require_contractor_or_admin)
 ):
     """Register or update a browser push subscription for the logged-in user."""
     db = get_db()
@@ -1422,7 +1343,7 @@ async def subscribe_push_notifications(
 @router.delete('/push/subscribe')
 async def unsubscribe_push_notifications(
     endpoint: Optional[str] = None,
-    user: User = Depends(get_current_user)
+    user: User = Depends(require_contractor_or_admin)
 ):
     """Unregister push subscription(s) for the logged-in user."""
     db = get_db()
@@ -1433,7 +1354,7 @@ async def unsubscribe_push_notifications(
 @router.post('/push/send-test')
 async def send_test_push(
     payload: SendPushTestRequest,
-    user: User = Depends(get_current_user)
+    user: User = Depends(require_contractor_or_admin)
 ):
     """Sends a test push notification to verify device receipt."""
     db = get_db()

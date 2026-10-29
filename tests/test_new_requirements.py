@@ -1,60 +1,27 @@
-import pytest
+"""Integration route tests are isolated from live databases and accounts."""
+from unittest.mock import patch, AsyncMock
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from server import app
-import uuid
-from datetime import datetime, timezone
-
-client = TestClient(app)
+from auth import get_current_user
+from models import User
+from routers.contractor import router
+from tests.contractor_fixtures import mock_database, contractor_environment
 
 
 def test_integration_poll_and_config():
-    # Test getting integration config
-    # Use login to get an admin token
-    try:
-        login_res = client.post('/api/auth/login', json={'email': 'shaun@omnisuiteai.com', 'password': 'Password123!'})
-    except Exception:
-        # Remote database unresolvable in sandboxed/offline test runner
-        return
-    if login_res.status_code != 200:
-        # Fallback test user
-        return
-
-    token = login_res.json().get('token')
-    headers = {'Authorization': f'Bearer {token}'}
-
-    # 1. Test GET /api/contractor/integrations/config
-    cfg_res = client.get('/api/contractor/integrations/config', headers=headers)
-    assert cfg_res.status_code == 200
-    cfg = cfg_res.json()
-    assert 'api_url' in cfg
-    assert 'polling_interval_minutes' in cfg
-
-    # 2. Test POST /api/contractor/integrations/config
-    save_res = client.post(
-        '/api/contractor/integrations/config',
-        headers=headers,
-        json={
-            'api_url': 'https://deliverycentre.goodshowroom.com',
-            'api_key': 'test-key-12345',
-            'webhook_url': 'https://byd-panel.omnisuiteai.com/api/contractor/integrations/webhook',
-            'polling_interval_minutes': 15,
-            'auto_poll_enabled': True
-        }
-    )
-    assert save_res.status_code == 200
-    assert save_res.json()['success'] is True
-
-    # 3. Test POST /api/contractor/integrations/poll
-    poll_res = client.post('/api/contractor/integrations/poll', headers=headers)
-    assert poll_res.status_code == 200
-    pdata = poll_res.json()
-    assert 'status' in pdata
-
-    # 4. Test Inbound Webhook: /api/contractor/integrations/webhook
-    wh_res = client.post('/api/contractor/integrations/webhook', json={
-        'event': 'job.due_date_updated',
-        'vin': 'TESTVIN999999',
-        'due_date': '2026-12-01'
-    })
-    assert wh_res.status_code == 200
-    assert wh_res.json()['received'] is True
+    app = FastAPI()
+    app.include_router(router)
+    admin = User(id='admin', email='admin@example.com', name='Admin', role='admin')
+    app.dependency_overrides[get_current_user] = lambda: admin
+    db = mock_database()
+    client = TestClient(app)
+    with patch('routers.contractor.get_db', return_value=db), patch('routers.contractor.poll_delivery_centre_integration', new=AsyncMock(return_value={'status': 'success'})):
+        assert client.get('/api/contractor/integrations/config').status_code == 403
+        admin.role = 'super_admin'
+        assert client.get('/api/contractor/integrations/config').status_code == 200
+        response = client.post('/api/contractor/integrations/config', json={'polling_interval_minutes': 15, 'api_key': 'private-test-key'})
+        assert response.status_code == 200
+        assert response.json()['config']['api_key'] == ''
+        assert client.post('/api/contractor/integrations/poll').json()['status'] == 'success'
+        assert client.post('/api/contractor/integrations/webhook', json={'event': 'job.updated'}).status_code == 401
+        db.contractor_jobs.update_one.assert_not_awaited()

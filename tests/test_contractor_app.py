@@ -1,3 +1,4 @@
+from tests.contractor_fixtures import mock_database, async_collection, contractor_environment
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -124,16 +125,16 @@ def test_contractor_user_role_and_profile():
 
 @pytest.mark.anyio
 async def test_clock_in_and_out_calculates_duration():
-    mock_db = MagicMock()
-    mock_db.contractor_time_logs = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.contractor_activities = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_time_logs = async_collection()
+    mock_db.contractor_jobs = async_collection()
+    mock_db.contractor_activities = async_collection()
 
     # Initially not clocked in
     mock_db.contractor_time_logs.find_one = AsyncMock(return_value=None)
     mock_db.contractor_time_logs.insert_one = AsyncMock()
     mock_db.contractor_time_logs.update_one = AsyncMock()
-    mock_db.contractor_jobs.find_one = AsyncMock(return_value={'id': 'job-1', 'status': 'requested'})
+    mock_db.contractor_jobs.find_one = AsyncMock(return_value={'id': 'job-1', 'status': 'requested', 'checklist': [{'id': 'task-1', 'title': 'Tint'}]})
     mock_db.contractor_jobs.update_one = AsyncMock()
     mock_db.contractor_activities.insert_one = AsyncMock()
 
@@ -188,8 +189,8 @@ async def test_clock_in_and_out_calculates_duration():
 
 @pytest.mark.anyio
 async def test_double_clock_in_prevented():
-    mock_db = MagicMock()
-    mock_db.contractor_time_logs = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_time_logs = async_collection()
     # Already has active entry
     mock_db.contractor_time_logs.find_one = AsyncMock(return_value={'id': 'active-log', 'clock_out': None})
 
@@ -208,10 +209,10 @@ async def test_double_clock_in_prevented():
 
 @pytest.mark.anyio
 async def test_register_vehicle_location():
-    mock_db = MagicMock()
-    mock_db.contractor_locations = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.contractor_activities = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_locations = async_collection()
+    mock_db.contractor_jobs = async_collection()
+    mock_db.contractor_activities = async_collection()
 
     mock_db.contractor_locations.insert_one = AsyncMock()
     mock_db.contractor_jobs.update_one = AsyncMock()
@@ -243,12 +244,12 @@ async def test_register_vehicle_location():
 
 @pytest.mark.anyio
 async def test_create_job_from_delivery_client():
-    mock_db = MagicMock()
-    mock_db.clients = MagicMock()
-    mock_db.users = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.contractor_activities = MagicMock()
-    mock_db.contractor_sync_logs = MagicMock()
+    mock_db = mock_database()
+    mock_db.clients = async_collection()
+    mock_db.users = async_collection()
+    mock_db.contractor_jobs = async_collection()
+    mock_db.contractor_activities = async_collection()
+    mock_db.contractor_sync_logs = async_collection()
 
     mock_client = {
         'id': 'client-dc-1',
@@ -290,10 +291,10 @@ async def test_create_job_from_delivery_client():
 
 @pytest.mark.anyio
 async def test_sync_completed_job_to_delivery_client():
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.clients = MagicMock()
-    mock_db.contractor_sync_logs = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_jobs = async_collection()
+    mock_db.clients = async_collection()
+    mock_db.contractor_sync_logs = async_collection()
 
     mock_job = {
         'id': 'job-1',
@@ -336,8 +337,8 @@ async def test_sync_completed_job_to_delivery_client():
 
 @pytest.mark.anyio
 async def test_compute_contractor_analytics():
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_jobs = async_collection()
 
     mock_jobs = [
         {
@@ -386,8 +387,8 @@ async def test_compute_contractor_analytics():
 
 @pytest.mark.anyio
 async def test_generate_contractor_jobs_csv():
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_jobs = async_collection()
 
     mock_jobs = [
         {
@@ -430,7 +431,7 @@ async def test_generate_contractor_jobs_csv():
 
 @pytest.mark.anyio
 async def test_generate_contractor_jobs_xlsx():
-    mock_db = MagicMock()
+    mock_db = mock_database()
     mock_jobs = [
         {
             'id': 'job-xlsx-1',
@@ -475,7 +476,7 @@ async def test_generate_contractor_jobs_xlsx():
 
 @pytest.mark.anyio
 async def test_generate_contractor_jobs_pdf():
-    mock_db = MagicMock()
+    mock_db = mock_database()
     mock_jobs = [
         {
             'id': 'job-pdf-1',
@@ -518,17 +519,17 @@ async def test_generate_contractor_jobs_pdf():
 
 @pytest.mark.anyio
 async def test_bulk_import_contractor_jobs():
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_jobs = async_collection()
     mock_db.contractor_jobs.insert_one = AsyncMock(return_value=MagicMock())
-    mock_db.contractor_activities = MagicMock()
+    mock_db.contractor_activities = async_collection()
     mock_db.contractor_activities.insert_one = AsyncMock(return_value=MagicMock())
-    mock_db.contractor_templates = MagicMock()
+    mock_db.contractor_templates = async_collection()
     mock_db.contractor_templates.find_one = AsyncMock(return_value={
         'id': 'tmpl-1',
         'tasks': ['Clean exterior', 'Apply tint']
     })
-    mock_db.users = MagicMock()
+    mock_db.users = async_collection()
     mock_db.users.find_one = AsyncMock(return_value={'id': 'c-1', 'name': 'Contractor Bob'})
 
     user = User(id='admin-1', email='admin@byd.com', name='Admin', role='admin')
@@ -556,10 +557,11 @@ async def test_bulk_import_contractor_jobs():
 
 @pytest.mark.anyio
 async def test_process_offline_batch_sync():
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_jobs = async_collection()
     mock_db.contractor_jobs.find_one = AsyncMock(return_value={
         'id': 'job-sync-1',
+        'assigned_contractor_id': 'contractor-1',
         'model_name': 'BYD Atto 3',
         'full_vin': 'LC0ATTO3999999999',
         'last_6_vin': '999999',
@@ -568,16 +570,16 @@ async def test_process_offline_batch_sync():
         'checklist': [{'id': 'task-1', 'title': 'Tint', 'completed': False}]
     })
     mock_db.contractor_jobs.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
-    mock_db.contractor_time_logs = MagicMock()
+    mock_db.contractor_time_logs = async_collection()
     mock_db.contractor_time_logs.find_one = AsyncMock(return_value=None)
     mock_db.contractor_time_logs.insert_one = AsyncMock(return_value=MagicMock())
-    mock_db.contractor_activities = MagicMock()
+    mock_db.contractor_activities = async_collection()
     mock_db.contractor_activities.insert_one = AsyncMock(return_value=MagicMock())
-    mock_db.contractor_locations = MagicMock()
+    mock_db.contractor_locations = async_collection()
     mock_db.contractor_locations.insert_one = AsyncMock(return_value=MagicMock())
-    mock_db.contractor_sync_logs = MagicMock()
+    mock_db.contractor_sync_logs = async_collection()
     mock_db.contractor_sync_logs.insert_one = AsyncMock(return_value=MagicMock())
-    mock_db.clients = MagicMock()
+    mock_db.clients = async_collection()
     mock_db.clients.find_one = AsyncMock(return_value=None)
     mock_db.clients.update_one = AsyncMock(return_value=MagicMock())
 
@@ -635,14 +637,14 @@ def test_contractor_api_endpoints_with_mock_db():
     app.dependency_overrides[require_admin] = lambda: admin_user
     app.dependency_overrides[require_contractor_or_admin] = lambda: admin_user
 
-    mock_db = MagicMock()
-    mock_db.contractor_jobs = MagicMock()
-    mock_db.contractor_job_templates = MagicMock()
-    mock_db.contractor_activities = MagicMock()
-    mock_db.contractor_sync_logs = MagicMock()
-    mock_db.contractor_time_logs = MagicMock()
-    mock_db.clients = MagicMock()
-    mock_db.users = MagicMock()
+    mock_db = mock_database()
+    mock_db.contractor_jobs = async_collection()
+    mock_db.contractor_job_templates = async_collection()
+    mock_db.contractor_activities = async_collection()
+    mock_db.contractor_sync_logs = async_collection()
+    mock_db.contractor_time_logs = async_collection()
+    mock_db.clients = async_collection()
+    mock_db.users = async_collection()
 
     class MockCursor:
         def __init__(self, data):
@@ -726,17 +728,16 @@ def test_contractor_api_endpoints_with_mock_db():
         assert resp.status_code == 200
         sync_st = resp.json()
         assert sync_st['health'] == 'Healthy'
-        assert sync_st['uptime_status'] == 'Operational'
+        assert sync_st['uptime_status'] == 'Shared database'
         assert 'error_rate_pct' in sync_st
         assert 'data_volume_24h' in sync_st
 
-        # 6. Webhook receiver
+        # 6. Webhook receiver requires a separate integration credential.
         resp = client.post('/api/contractor/integrations/webhook', json={
             'event': 'delivery.accessory_ordered',
             'client_id': 'client-1'
         })
-        assert resp.status_code == 200
-        assert resp.json()['received'] is True
+        assert resp.status_code == 401
 
         # 7. Multi-Format Export Endpoints (Excel & PDF)
         mock_db.contractor_jobs.find = MagicMock(return_value=MockCursor([

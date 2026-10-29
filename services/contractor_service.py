@@ -19,11 +19,6 @@ from contractor_models import (
 
 log = logging.getLogger('contractor_service')
 
-CONTRACTOR_WEBHOOK_URL = os.environ.get(
-    'CONTRACTOR_WEBHOOK_URL',
-    os.environ.get('CONTRACTOR_APP_URL', 'https://byd-contractor-app.vercel.app') + '/api/webhooks/contractor'
-)
-
 
 async def _safe_call(coro_or_val):
     if inspect.isawaitable(coro_or_val):
@@ -48,7 +43,8 @@ async def log_job_activity(
     author_name: str,
     message: str,
     meta: Optional[dict] = None,
-    created_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None,
+    action_id: Optional[str] = None
 ):
     activity = JobActivity(
         job_id=job_id,
@@ -59,38 +55,23 @@ async def log_job_activity(
         meta=meta or {},
         created_at=created_at or datetime.now(timezone.utc)
     )
-    await db.contractor_activities.insert_one(activity.model_dump(mode='json'))
+    if action_id:
+        activity.id = str(uuid.uuid5(uuid.NAMESPACE_URL, author_id + ':' + action_id))
+        await db.contractor_activities.update_one({'id': activity.id}, {'$setOnInsert': {**activity.model_dump(mode='json'), '_id': activity.id}}, upsert=True)
+    else:
+        await db.contractor_activities.insert_one(activity.model_dump(mode='json'))
     return activity
 
 
 # ---------------------------------------------------------------------------
 # Webhook Dispatcher
 # ---------------------------------------------------------------------------
-async def _send_contractor_webhook_async(payload: dict):
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(CONTRACTOR_WEBHOOK_URL, json=payload)
-            if resp.status_code >= 400:
-                log.warning("Contractor webhook returned %s: %s", resp.status_code, resp.text)
-            else:
-                log.info("Contractor webhook dispatched successfully: event=%s", payload.get('event'))
-    except Exception as exc:
-        log.debug("Contractor webhook dispatch failed (non-blocking): %s", exc)
-
-
-def dispatch_contractor_webhook(event: str, job_id: str, payload_data: dict):
-    webhook_payload = {
-        "event_id": f"EVT-CONTR-{uuid.uuid4().hex[:12].upper()}",
-        "event": event,
-        "job_id": job_id,
-        "payload": payload_data,
-        "dispatched_at": datetime.now(timezone.utc).isoformat()
-    }
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_send_contractor_webhook_async(webhook_payload))
-    except RuntimeError:
-        pass
+async def dispatch_contractor_webhook(event, job_id, payload_data, db=None):
+    from services.contractor_integration import queue_job_event
+    if db is None:
+        from db import get_db
+        db = get_db()
+    return await queue_job_event(db, event, job_id, payload_data)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +108,16 @@ async def sync_job_to_delivery_client(db, job_id: str, actor_name: str = 'System
                 ))
 
     if not client:
+        from services.contractor_integration import integration_config, build_snapshot, queue_job_event
+        config = await integration_config(db)
+        if config['outbound_webhook_url']:
+            snapshot = await build_snapshot(db, job_doc)
+            await queue_job_event(db, 'job.snapshot', job_id, snapshot)
+            await db.contractor_jobs.update_one({'id': job_id}, {'$set': {'sync_status': 'pending', 'sync_error': None}})
+            queued = IntegrationSyncLog(job_id=job_id, client_id=client_id, direction='outbound_to_delivery',
+                event='job.queued_for_remote_delivery', status='pending', synced_at=now)
+            await db.contractor_sync_logs.insert_one(queued.model_dump(mode='json'))
+            return queued
         if hasattr(db, 'contractor_jobs'):
             await _safe_call(db.contractor_jobs.update_one(
                 {'id': job_id},
@@ -161,17 +152,20 @@ async def sync_job_to_delivery_client(db, job_id: str, actor_name: str = 'System
                 accessories_changed = True
         updated_accessories.append(acc)
 
-    client_updates: Dict[str, Any] = {'updated_at': now}
+    from services.contractor_integration import build_snapshot
+    snapshot = await build_snapshot(db, job_doc)
+    client_updates: Dict[str, Any] = {'updated_at': now, f'contractor_jobs.{job_id}': snapshot}
     if accessories_changed:
         client_updates['accessories'] = updated_accessories
 
     # If contractor job registered vehicle bay location, mirror to client location note
     if job_doc.get('bay_location'):
-        client_updates['location'] = f"Fairfield - Bay {job_doc['bay_location']}"
+        client_updates['location'] = f"{job_doc.get('site_location') or 'Fairfield'} - {job_doc['bay_location']}"
 
     # If job status completed or returned, leave an audit note on client comments
     job_status = job_doc.get('status')
-    if job_status in ('completed', 'returned'):
+    previous = (client.get('contractor_jobs') or {}).get(job_id, {})
+    if job_status in ('completed', 'returned', 'invoiced') and previous.get('status') != job_status:
         comment_body = (
             f"Contractor Job {job_id} ({job_doc.get('model_name')}) status is '{job_status}'. "
             f"Total contractor time: {job_doc.get('total_time_seconds', 0) // 60} minutes."
@@ -191,12 +185,15 @@ async def sync_job_to_delivery_client(db, job_id: str, actor_name: str = 'System
                     '$push': {'comments': new_comment}
                 }
             ))
-    elif accessories_changed or 'location' in client_updates:
+    else:
         if hasattr(db, 'clients'):
             await _safe_call(db.clients.update_one(
                 {'id': client_id},
                 {'$set': client_updates}
             ))
+
+    from services.contractor_integration import queue_job_event
+    await queue_job_event(db, 'job.snapshot', job_id, snapshot)
 
     # Persist sync success state on contractor job
     if hasattr(db, 'contractor_jobs'):
@@ -249,6 +246,12 @@ async def create_job_from_delivery_client(
     client = await db.clients.find_one({'id': client_id})
     if not client:
         raise ValueError('Client not found')
+
+    if created_by_user:
+        from auth import assert_site_access
+        from services.contractor_access import validate_assignment
+        assert_site_access(created_by_user, client)
+        await validate_assignment(db, created_by_user, assigned_contractor_id, client.get('site_location') or 'Fairfield')
 
     # Checklist generation
     checklist_items: List[JobTask] = []
@@ -326,7 +329,10 @@ async def create_job_from_delivery_client(
     )
     await db.contractor_sync_logs.insert_one(sync_log.model_dump(mode='json'))
 
-    dispatch_contractor_webhook('job.created', new_job.id, new_job.model_dump(mode='json'))
+    if new_job.assigned_contractor_id:
+        from services.push_service import notify_contractor_job_assigned
+        await notify_contractor_job_assigned(db, new_job.model_dump(mode='json'), new_job.assigned_contractor_id)
+    await dispatch_contractor_webhook('job.created', new_job.id, new_job.model_dump(mode='json'), db)
 
     return new_job
 
@@ -356,6 +362,20 @@ async def sync_client_updates_to_contractor_jobs(
         job_updates['rego'] = updates['rego']
     if 'vehicle' in updates and updates['vehicle']:
         job_updates['model_name'] = updates['vehicle']
+    if 'notes' in updates:
+        job_updates['description'] = updates['notes']
+    if 'status' in updates and updates['status'] in ('requested', 'collected', 'in_progress', 'returned', 'completed', 'invoiced'):
+        job_updates['status'] = updates['status']
+        if updates['status'] in ('completed', 'returned', 'invoiced'):
+            job_updates[updates['status'] + '_at'] = now
+    if 'due_date' in updates:
+        job_updates['due_date'] = updates['due_date']
+    if 'priority' in updates:
+        job_updates['priority'] = updates['priority']
+        job_updates['is_urgent'] = updates['priority'] == 'urgent'
+    if 'is_urgent' in updates:
+        job_updates['is_urgent'] = bool(updates['is_urgent'])
+        job_updates['priority'] = 'urgent' if updates['is_urgent'] else 'normal'
     if 'alert' in updates and updates['alert']:
         job_updates['priority'] = 'urgent'
         job_updates['is_urgent'] = True
@@ -379,7 +399,10 @@ async def sync_client_updates_to_contractor_jobs(
             meta=job_updates,
             created_at=now
         )
-        dispatch_contractor_webhook('job.updated', job['id'], {**job, **job_updates})
+        if job_updates.get('is_urgent') and not job.get('is_urgent'):
+            from services.push_service import notify_urgent_issue_flagged
+            await notify_urgent_issue_flagged(db, {**job, **job_updates}, updates.get('alert') or 'Urgent Delivery Centre update', actor_name)
+        await dispatch_contractor_webhook('job.updated', job['id'], {**job, **job_updates}, db)
 
 
 # ---------------------------------------------------------------------------
@@ -397,19 +420,19 @@ async def clock_in_contractor(
 ) -> JobTimeEntry:
     # If client_action_id given (e.g., offline queue sync), check for idempotent duplicate
     if client_action_id:
-        existing = await db.contractor_time_logs.find_one({'client_action_id': client_action_id})
+        existing = await db.contractor_time_logs.find_one({'client_action_id': client_action_id, 'contractor_id': contractor_id})
         if existing:
             return JobTimeEntry(**_strip(existing))
 
+    job = await db.contractor_jobs.find_one({'id': job_id})
+    if task_id and not any(t.get('id') == task_id for t in (job or {}).get('checklist', [])):
+        raise ValueError('Task is not part of this job')
     # Verify no active un-clocked-out entry for this contractor & job
     active_entry = await db.contractor_time_logs.find_one({
-        'job_id': job_id,
         'contractor_id': contractor_id,
         'clock_out': None
     })
     if active_entry:
-        if client_action_id:
-            return JobTimeEntry(**_strip(active_entry))
         raise ValueError('Contractor is already clocked on for this job')
 
     now = clock_in_time or datetime.now(timezone.utc)
@@ -465,10 +488,14 @@ async def clock_out_contractor(
     contractor_id: str,
     contractor_name: str,
     notes: Optional[str] = None,
-    clock_out_time: Optional[datetime] = None
+    clock_out_time: Optional[datetime] = None,
+    client_action_id: Optional[str] = None
 ) -> JobTimeEntry:
-    # Find active time log
-    active_entry = await db.contractor_time_logs.find_one({
+    done = None
+    if client_action_id:
+        done = await db.contractor_time_logs.find_one({'clock_out_action_id': client_action_id, 'contractor_id': contractor_id})
+    # Find active time log, or resume accounting for an already-closed offline action.
+    active_entry = done or await db.contractor_time_logs.find_one({
         'job_id': job_id,
         'contractor_id': contractor_id,
         'clock_out': None
@@ -476,7 +503,7 @@ async def clock_out_contractor(
     if not active_entry:
         raise ValueError('No active clock-in found for this job')
 
-    now = clock_out_time or datetime.now(timezone.utc)
+    now = (done.get('clock_out') if done else clock_out_time) or datetime.now(timezone.utc)
     if isinstance(now, str):
         now = datetime.fromisoformat(now.replace('Z', '+00:00'))
     elif now.tzinfo is None:
@@ -495,6 +522,7 @@ async def clock_out_contractor(
         {
             '$set': {
                 'clock_out': now,
+                'clock_out_action_id': client_action_id,
                 'duration_seconds': duration,
                 'notes': notes or active_entry.get('notes')
             }
@@ -505,16 +533,18 @@ async def clock_out_contractor(
     task_id = active_entry.get('task_id')
     if task_id:
         await db.contractor_jobs.update_one(
-            {'id': job_id, 'checklist.id': task_id},
+            {'id': job_id, 'checklist.id': task_id, 'applied_time_entries': {'$ne': active_entry['id']}},
             {
+                '$addToSet': {'applied_time_entries': active_entry['id']},
                 '$inc': {'total_time_seconds': duration, 'checklist.$.duration_seconds': duration},
                 '$set': {'updated_at': now}
             }
         )
     else:
         await db.contractor_jobs.update_one(
-            {'id': job_id},
+            {'id': job_id, 'applied_time_entries': {'$ne': active_entry['id']}},
             {
+                '$addToSet': {'applied_time_entries': active_entry['id']},
                 '$inc': {'total_time_seconds': duration},
                 '$set': {'updated_at': now}
             }
@@ -529,7 +559,7 @@ async def clock_out_contractor(
         author_name=contractor_name,
         message=f"Clocked OFF. Duration: {mins}m ({duration}s). Notes: {notes or 'Shift ended'}",
         meta={'time_entry_id': active_entry['id'], 'duration_seconds': duration},
-        created_at=now
+        created_at=now, action_id='clock-out:' + active_entry['id']
     )
 
     # Sync updated time tracking data to delivery centre client
@@ -557,7 +587,8 @@ async def register_vehicle_location(
     accuracy: Optional[float] = None,
     location_name: Optional[str] = None,
     notes: Optional[str] = None,
-    recorded_at: Optional[datetime] = None
+    recorded_at: Optional[datetime] = None,
+    client_action_id: Optional[str] = None
 ) -> JobLocationEntry:
     rec_dt = recorded_at or datetime.now(timezone.utc)
     if isinstance(rec_dt, str):
@@ -576,7 +607,11 @@ async def register_vehicle_location(
         recorded_by_id=user_id,
         recorded_by_name=user_name
     )
-    await db.contractor_locations.insert_one(entry.model_dump(mode='json'))
+    if client_action_id:
+        entry.id = str(uuid.uuid5(uuid.NAMESPACE_URL, user_id + ':' + client_action_id))
+        await db.contractor_locations.update_one({'id': entry.id}, {'$setOnInsert': entry.model_dump(mode='json')}, upsert=True)
+    else:
+        await db.contractor_locations.insert_one(entry.model_dump(mode='json'))
 
     # Update job's bay_location or location string
     job_update: Dict[str, Any] = {'updated_at': rec_dt}
@@ -605,119 +640,14 @@ async def register_vehicle_location(
 # ---------------------------------------------------------------------------
 # Analytics, Reporting & CSV Export
 # ---------------------------------------------------------------------------
-async def compute_contractor_analytics(
-    db,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    contractor_id: Optional[str] = None,
-    model: Optional[str] = None
-) -> Dict[str, Any]:
-    query: Dict[str, Any] = {}
-    if contractor_id:
-        query['assigned_contractor_id'] = contractor_id
-    if model:
-        query['model_name'] = {'$regex': model, '$options': 'i'}
-    if date_from or date_to:
-        created_range = {}
-        if date_from:
-            dt_from = datetime.fromisoformat(date_from)
-            if dt_from.tzinfo is None:
-                dt_from = dt_from.replace(tzinfo=timezone.utc)
-            created_range['$gte'] = dt_from
-        if date_to:
-            dt_to = datetime.fromisoformat(date_to)
-            if len(date_to) <= 10:
-                dt_to = dt_to.replace(hour=23, minute=59, second=59, microsecond=999999)
-            if dt_to.tzinfo is None:
-                dt_to = dt_to.replace(tzinfo=timezone.utc)
-            created_range['$lte'] = dt_to
-        query['created_at'] = created_range
-
-    total_jobs = await db.contractor_jobs.count_documents(query)
-    completed_query = {**query, 'status': 'completed'}
-    completed_jobs = await db.contractor_jobs.count_documents(completed_query)
-
-    # Average time calculation
-    total_time_seconds = 0
-    jobs_with_time = 0
-    today_iso = datetime.now(timezone.utc).date().isoformat()
-    overdue_count = 0
-
-    jobs_by_status: Dict[str, int] = {}
-    jobs_by_model: Dict[str, int] = {}
-    jobs_per_contractor: Dict[str, int] = {}
-    completed_per_vin: List[Dict[str, Any]] = []
-
-    async for j in db.contractor_jobs.find(query):
-        st = j.get('status', 'requested')
-        jobs_by_status[st] = jobs_by_status.get(st, 0) + 1
-
-        mdl = j.get('model_name') or 'Other'
-        jobs_by_model[mdl] = jobs_by_model.get(mdl, 0) + 1
-
-        c_name = j.get('assigned_contractor_name') or 'Unassigned'
-        jobs_per_contractor[c_name] = jobs_per_contractor.get(c_name, 0) + 1
-
-        # Turnaround time
-        t_sec = j.get('total_time_seconds', 0)
-        if t_sec > 0:
-            total_time_seconds += t_sec
-            jobs_with_time += 1
-
-        # Overdue check
-        due = j.get('due_date')
-        if due and due < today_iso and st not in ('completed', 'invoiced'):
-            overdue_count += 1
-
-        if st in ('completed', 'invoiced'):
-            completed_per_vin.append({
-                'job_id': j.get('id'),
-                'vin': j.get('full_vin'),
-                'last_6_vin': j.get('last_6_vin'),
-                'model': j.get('model_name'),
-                'contractor': j.get('assigned_contractor_name'),
-                'completed_at': j.get('completed_at'),
-                'total_minutes': round(j.get('total_time_seconds', 0) / 60, 1)
-            })
-
-    avg_job_minutes = round((total_time_seconds / jobs_with_time) / 60, 1) if jobs_with_time > 0 else 0
-    completion_rate = round((completed_jobs / total_jobs * 100), 1) if total_jobs > 0 else 0.0
-
-    # Per-task average time aggregation
-    task_durations: Dict[str, List[int]] = {}
-    async for j in db.contractor_jobs.find(query):
-        for task in j.get('checklist', []):
-            t_dur = task.get('duration_seconds', 0)
-            t_title = (task.get('title') or '').strip()
-            if t_title and t_dur > 0:
-                task_durations.setdefault(t_title, []).append(t_dur)
-
-    average_time_per_task = [
-        {
-            'task_title': title,
-            'avg_minutes': round((sum(durs) / len(durs)) / 60, 1),
-            'total_completed': len(durs)
-        }
-        for title, durs in task_durations.items()
-    ]
-    average_time_per_task.sort(key=lambda x: x['total_completed'], reverse=True)
-
-    return {
-        'total_jobs': total_jobs,
-        'completed_jobs': completed_jobs,
-        'completion_rate_percent': completion_rate,
-        'overdue_jobs_count': overdue_count,
-        'average_time_minutes': avg_job_minutes,
-        'average_time_per_task': average_time_per_task,
-        'jobs_by_status': jobs_by_status,
-        'jobs_by_model': jobs_by_model,
-        'jobs_by_contractor': jobs_per_contractor,
-        'completed_per_vin': completed_per_vin
-    }
+async def compute_contractor_analytics(db, date_from=None, date_to=None, contractor_id=None, model=None, status=None, site=None):
+    from services.contractor_reporting import analytics
+    return await analytics(db, date_from=date_from, date_to=date_to, contractor_id=contractor_id, model=model, status=status, site=site)
 
 
-async def generate_contractor_jobs_csv(db, contractor_id: Optional[str] = None) -> str:
-    query: Dict[str, Any] = {}
+async def generate_contractor_jobs_csv(db, contractor_id: Optional[str] = None, **filters) -> str:
+    from services.contractor_reporting import report_query
+    query = report_query(contractor_id=contractor_id, **filters)
     if contractor_id:
         query['assigned_contractor_id'] = contractor_id
 
@@ -770,9 +700,10 @@ async def generate_contractor_jobs_csv(db, contractor_id: Optional[str] = None) 
     return output.getvalue()
 
 
-async def generate_contractor_jobs_xlsx(db, contractor_id: Optional[str] = None) -> bytes:
+async def generate_contractor_jobs_xlsx(db, contractor_id: Optional[str] = None, **filters) -> bytes:
     """Generate Excel (.xlsx) spreadsheet of contractor jobs."""
-    query: Dict[str, Any] = {}
+    from services.contractor_reporting import report_query
+    query = report_query(contractor_id=contractor_id, **filters)
     if contractor_id:
         query['assigned_contractor_id'] = contractor_id
 
@@ -885,9 +816,10 @@ async def generate_contractor_jobs_xlsx(db, contractor_id: Optional[str] = None)
     return buf.getvalue()
 
 
-async def generate_contractor_jobs_pdf(db, contractor_id: Optional[str] = None) -> bytes:
+async def generate_contractor_jobs_pdf(db, contractor_id: Optional[str] = None, **filters) -> bytes:
     """Generate PDF report of contractor jobs."""
-    query: Dict[str, Any] = {}
+    from services.contractor_reporting import report_query
+    query = report_query(contractor_id=contractor_id, **filters)
     contractor_name_filter = "All Contractors"
     if contractor_id:
         query['assigned_contractor_id'] = contractor_id
@@ -1060,9 +992,19 @@ async def process_offline_batch_sync(
         queued_at = action.queued_at or datetime.now(timezone.utc)
 
         try:
+            from services.contractor_access import assert_job_access
             job = await db.contractor_jobs.find_one({'id': job_id})
-            if not job:
-                raise ValueError(f"Job '{job_id}' not found")
+            assert_job_access(user, job)
+            if queued_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+                raise ValueError('Queued timestamp is in the future')
+            receipt_query = {'user_id': user.id, 'action_id': action_id}
+            receipt = await db.contractor_offline_actions.find_one(receipt_query)
+            if receipt and receipt.get('status') == 'success':
+                succeeded += 1
+                results.append(OfflineActionResult(client_action_id=action_id, success=True, message='Already applied'))
+                continue
+            if act_type == 'clock_in' and payload.get('task_id') and not any(t.get('id') == payload['task_id'] for t in job.get('checklist', [])):
+                raise ValueError('Task is not part of this job')
 
             if act_type == 'clock_in':
                 await clock_in_contractor(
@@ -1082,7 +1024,8 @@ async def process_offline_batch_sync(
                     contractor_id=user.id,
                     contractor_name=user.name,
                     notes=payload.get('notes'),
-                    clock_out_time=queued_at
+                    clock_out_time=queued_at,
+                    client_action_id=action_id
                 )
             elif act_type == 'location_checkin':
                 await register_vehicle_location(
@@ -1095,7 +1038,8 @@ async def process_offline_batch_sync(
                     accuracy=payload.get('accuracy'),
                     location_name=payload.get('location_name'),
                     notes=payload.get('notes'),
-                    recorded_at=queued_at
+                    recorded_at=queued_at,
+                    client_action_id=action_id
                 )
             elif act_type == 'add_comment':
                 msg = payload.get('message') or payload.get('comment') or 'Offline note'
@@ -1106,7 +1050,7 @@ async def process_offline_batch_sync(
                     author_id=user.id,
                     author_name=user.name,
                     message=msg,
-                    created_at=queued_at
+                    created_at=queued_at, action_id=action_id
                 )
             elif act_type == 'update_task':
                 task_id = payload.get('task_id')
@@ -1140,7 +1084,7 @@ async def process_offline_batch_sync(
                     author_name=user.name,
                     message=f"Checklist task updated ({'Completed' if completed else 'Unchecked'})",
                     meta={'task_id': task_id, 'completed': completed},
-                    created_at=queued_at
+                    created_at=queued_at, action_id=action_id
                 )
             elif act_type == 'flag_issue':
                 desc = payload.get('description') or 'Issue reported offline'
@@ -1168,7 +1112,7 @@ async def process_offline_batch_sync(
                     author_name=user.name,
                     message=f"ISSUE FLAGGED: {desc}",
                     meta={'is_urgent': is_urg},
-                    created_at=queued_at
+                    created_at=queued_at, action_id=action_id
                 )
                 try:
                     from services.push_service import notify_urgent_issue_flagged
@@ -1178,6 +1122,9 @@ async def process_offline_batch_sync(
             else:
                 raise ValueError(f"Unknown action_type: {act_type}")
 
+            if act_type in ('update_task', 'flag_issue', 'add_comment'):
+                await sync_job_to_delivery_client(db, job_id, user.name)
+            await db.contractor_offline_actions.update_one(receipt_query, {'$set': {'status': 'success', 'applied_at': datetime.now(timezone.utc)}}, upsert=True)
             succeeded += 1
             results.append(OfflineActionResult(
                 client_action_id=action_id,
@@ -1333,7 +1280,7 @@ async def bulk_import_contractor_jobs(
 # ---------------------------------------------------------------------------
 # Scheduled Polling Fallback (Spec §6: Polling every 5–15 minutes)
 # ---------------------------------------------------------------------------
-async def poll_delivery_centre_integration(db) -> Dict[str, Any]:
+async def poll_delivery_centre_integration(db, site=None) -> Dict[str, Any]:
     """
     Scheduled Polling Worker (every 5-15 mins) for two-way sync with deliverycentre.com.au.
     1. Scans Delivery Centre clients with accessories / pending aftermarket tasks.
@@ -1350,9 +1297,15 @@ async def poll_delivery_centre_integration(db) -> Dict[str, Any]:
         return {'status': 'skipped', 'message': 'No clients collection available'}
 
     try:
-        cursor = db.clients.find({'stage': {'$nin': ['Delivered', 'Cancelled']}})
-        if hasattr(cursor, 'limit'):
-            cursor = cursor.limit(200)
+        from services.contractor_integration import integration_config, poll_remote_requests
+        config = await integration_config(db)
+        if config['api_url']:
+            await poll_remote_requests(db, config)
+        client_query = {'stage': {'$nin': ['Delivered', 'Cancelled']}}
+        if site:
+            from services.contractor_access import site_filter
+            client_query['site_location'] = site_filter(site)
+        cursor = db.clients.find(client_query)
         async for client in cursor:
             c_id = client.get('id')
             if not c_id:
@@ -1392,21 +1345,25 @@ async def poll_delivery_centre_integration(db) -> Dict[str, Any]:
                     except Exception as ex:
                         log.warning("Could not auto-create job for client %s: %s", c_id, ex)
             else:
-                # Job exists - sync due dates and delivery dates if changed on client
+                # Fallback polling uses the same mapping as real-time Delivery Centre edits.
                 updates = {}
-                if delivery_date and job.get('delivery_date_time') != delivery_date:
-                    updates['delivery_date_time'] = delivery_date
-                    if not job.get('due_date'):
-                        updates['due_date'] = delivery_date
+                for source, target in [('delivery_date', 'delivery_date_time'), ('vin', 'full_vin'), ('rego', 'rego'), ('vehicle', 'model_name'), ('notes', 'description')]:
+                    if source in client and client[source] != job.get(target):
+                        updates[source] = client[source]
+                if delivery_date and job.get('due_date') != delivery_date:
+                    updates['due_date'] = delivery_date
+                if client.get('alert') and not job.get('is_urgent'):
+                    updates['alert'] = client['alert']
                 if updates:
-                    updates['updated_at'] = now
-                    updates['last_synced_at'] = now
-                    updates['sync_status'] = 'synced'
-                    await db.contractor_jobs.update_one({'id': job['id']}, {'$set': updates})
+                    await sync_client_updates_to_contractor_jobs(db, c_id, updates, 'Scheduled poll')
                     updated_count += 1
 
         # Also find completed contractor jobs that need outbound sync to Delivery Centre
-        async for cjob in db.contractor_jobs.find({'status': {'$in': ['completed', 'returned']}, 'sync_status': {'$ne': 'synced'}}):
+        outbound_query = {'sync_status': {'$ne': 'synced'}}
+        if site:
+            from services.contractor_access import site_filter
+            outbound_query['site_location'] = site_filter(site)
+        async for cjob in db.contractor_jobs.find(outbound_query):
             await sync_job_to_delivery_client(db, cjob['id'], 'Scheduled Poller')
             synced_back_count += 1
 

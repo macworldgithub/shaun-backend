@@ -49,6 +49,11 @@ async def ensure_indexes():
         except Exception:
             pass
 
+    await safe_index(db.contractor_outbox, 'id', unique=True)
+    await safe_index(db.contractor_outbox, [('status', 1), ('next_attempt_at', 1)])
+    await safe_index(db.contractor_webhook_receipts, 'event_id', unique=True)
+    await safe_index(db.contractor_offline_actions, [('user_id', 1), ('action_id', 1)], unique=True)
+    await safe_index(db.contractor_jobs, [('site_location', 1), ('assigned_contractor_id', 1)])
     await safe_index(db.users, 'email', unique=True)
     await safe_index(db.users, 'id')
     await safe_index(db.clients, 'id')
@@ -82,7 +87,11 @@ async def ensure_indexes():
     await safe_index(db.contractor_jobs, [('created_at', -1)])
     await safe_index(db.contractor_time_logs, [('job_id', 1), ('contractor_id', 1)])
     await safe_index(db.contractor_time_logs, [('contractor_id', 1), ('clock_out', 1)])
+    await safe_index(db.contractor_evidence, 'id', unique=True)
     await safe_index(db.contractor_evidence, [('job_id', 1), ('captured_at', -1)])
+    await safe_index(db.contractor_activities, 'id', unique=True)
+    await safe_index(db.contractor_locations, 'id', unique=True)
+    await safe_index(db.contractor_time_logs, [('contractor_id', 1), ('client_action_id', 1)], unique=True, partialFilterExpression={'client_action_id': {'$type': 'string'}})
     await safe_index(db.contractor_locations, [('job_id', 1), ('recorded_at', -1)])
     await safe_index(db.contractor_job_templates, 'id', unique=True)
     await safe_index(db.contractor_activities, [('job_id', 1), ('created_at', -1)])

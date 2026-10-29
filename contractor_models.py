@@ -94,6 +94,9 @@ class JobBase(BaseModel):
     sync_status: Optional[str] = 'pending'
     sync_error: Optional[str] = None
     last_synced_at: Optional[datetime] = None
+    outbound_sync_status: Optional[str] = None
+    outbound_sync_error: Optional[str] = None
+    outbound_last_synced_at: Optional[datetime] = None
     dc_job_id: Optional[str] = None
 
     @model_validator(mode='after')
