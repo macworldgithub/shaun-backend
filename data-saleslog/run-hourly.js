@@ -9,7 +9,7 @@ function execute(command, args, env) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: ROOT,
-      env,
+      env: { ...env, PYTHONDONTWRITEBYTECODE: "1" },
       stdio: "inherit",
       windowsHide: true,
     });
