@@ -100,6 +100,14 @@ class DealerStudioUpsertTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan_clients([row(dealership_id=999)], [], [])
 
+    def test_lead_and_inventory_models_share_storage_without_identity_collisions(self):
+        lead = raw_documents([row()], 'lead')[0]
+        car = raw_documents([row()], 'car')[0]
+        self.assertNotEqual(lead['_id'], car['_id'])
+        self.assertEqual(lead['record_type'], 'lead')
+        self.assertEqual(car['record_type'], 'car')
+        self.assertEqual(lead['source_id'], car['source_id'])
+
     def test_fresh_snapshot_checks_reject_stale_or_incomplete_exports(self):
         base = Path(__file__).resolve().parents[1] / '.runtime'
         base.mkdir(exist_ok=True)

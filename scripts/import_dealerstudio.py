@@ -21,8 +21,7 @@ SITE = 'Denza Melbourne'
 SLUG = 'denza-melbourne'
 DEALERSHIP = '2606'
 ELIGIBLE = {'contract signed', 'vehicle order', 'delivered'}
-RAW_LEADS = 'dealerstudio_lead_clusters'
-RAW_CARS = 'dealerstudio_inventory'
+RAW_COLLECTION = 'dealerstudio_records'
 
 
 def digest(value):
@@ -162,7 +161,7 @@ def plan_clients(rows, cars, documents):
 
 def raw_documents(rows, kind):
     return [{'_id': f'dealerstudio:{DEALERSHIP}:{kind}:{row["id"]}', 'dealership_id': DEALERSHIP,
-             'source_id': str(row['id']), 'site_location': SITE, 'source_hash': digest(row), 'source_data': row} for row in rows]
+             'record_type': kind, 'source_id': str(row['id']), 'site_location': SITE, 'source_hash': digest(row), 'source_data': row} for row in rows]
 
 
 def hash_documents(rows):
@@ -177,7 +176,8 @@ def run_import(directory, dry_run=False, backup=None, require_fresh=False):
         db = mongo[os.environ.get('DB_NAME', 'test_database')]
         clients = list(db.clients.find({}).batch_size(100))
         plan = plan_clients(snapshot['leads'], snapshot['cars'], clients)
-        sources = {RAW_LEADS: raw_documents(snapshot['leads'], 'lead'), RAW_CARS: raw_documents(snapshot['cars'], 'car')}
+        # Two logical models share one physical collection to fit Atlas collection quotas.
+        sources = {RAW_COLLECTION: [*raw_documents(snapshot['leads'], 'lead'), *raw_documents(snapshot['cars'], 'car')]}
         old = {name: list(db[name].find({}).batch_size(100)) for name in sources}
         raw_changes = {}
         for name, incoming in sources.items():
@@ -187,10 +187,11 @@ def run_import(directory, dry_run=False, backup=None, require_fresh=False):
                 existing = previous.get(row['_id'])
                 if existing and (str(existing.get('dealership_id')) != DEALERSHIP or not denza(existing)):
                     raise ValueError('A raw source identity collides with another dealership.')
-                if not existing or existing.get('source_hash') != row['source_hash'] or existing.get('source_data') != row['source_data']:
+                if not existing or existing.get('record_type') != row['record_type'] or existing.get('source_hash') != row['source_hash'] or existing.get('source_data') != row['source_data']:
                     raw_changes[name].append(row)
         summary = {'database': db.name, 'site': SITE, 'dry_run': dry_run, 'counts': plan['counts'], 'conflicts': plan['conflicts'],
-                   'source_counts': {name: len(rows) for name, rows in sources.items()}, 'raw_upserts': {name: len(rows) for name, rows in raw_changes.items()}}
+                   'source_counts': {'leads': len(snapshot['leads']), 'inventory': len(snapshot['cars'])},
+                   'storage_collection': RAW_COLLECTION, 'raw_upserts': {name: len(rows) for name, rows in raw_changes.items()}}
         if plan['conflicts']:
             raise ValueError('Duplicate Denza source identities must be resolved before importing.')
         if dry_run:
@@ -256,5 +257,6 @@ if __name__ == '__main__':
     try:
         print(json.dumps(run_import(args.input, args.dry_run, args.backup, args.require_fresh)))
     except Exception as error:
-        print(json.dumps({'status': 'failed', 'error': type(error).__name__, 'message': str(error) if isinstance(error, (ValueError, RuntimeError)) else 'Dealer Studio database import failed.'}))
+        print(json.dumps({'status': 'failed', 'error': type(error).__name__, 'database_code': getattr(error, 'code', None),
+                          'message': str(error) if isinstance(error, (ValueError, RuntimeError)) else 'Dealer Studio database import failed.'}))
         raise SystemExit(1)

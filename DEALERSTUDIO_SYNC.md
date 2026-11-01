@@ -4,8 +4,9 @@
 `2606` / `denza-melbourne` only. The source checkout is `/var/www/dealer-studio-byd`.
 
 The backend's configured `MONGO_URL` and `DB_NAME` are used. Full source data is
-upserted into `dealerstudio_lead_clusters` and `dealerstudio_inventory`, using
-dealership-scoped stable IDs and source hashes. Records absent from a later export
+upserted into `dealerstudio_records` with `record_type=lead` or `record_type=car`,
+using dealership-scoped stable IDs and source hashes. Sharing one physical
+collection keeps the deployment within the Atlas collection limit. Records absent from a later export
 are retained; this job does not delete database records.
 
 Existing `clients` with `site_location=Denza Melbourne`,
@@ -22,8 +23,8 @@ staff checklists are preserved. Empty source values do not erase enriched values
 VINs are copied only through a unique source stock/registration/slug match.
 Other dealerships and records from other importers are not updated.
 
-Every live import requires a private compressed backup of clients and the two
-raw collections. Writes have optimistic concurrency guards. Verification checks
+Every live import requires a private compressed backup of clients and the raw
+source collection. Writes have optimistic concurrency guards. Verification checks
 the source snapshots, unaffected records and a second client import with zero
 remaining changes. Ambiguous existing IDs fail before writes.
 
