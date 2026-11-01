@@ -11,5 +11,5 @@ Environment=TZ=Australia/Melbourne
 UMask=0077
 Nice=10
 TimeoutStartSec=45min
-ExecStart=/usr/bin/flock -n -E 75 /var/www/shaun-backend/.runtime/saleslogs-sync.lock /usr/bin/flock -w 180 -E 75 /var/www/shaun-backend/.runtime/saleslogs-session.lock /usr/bin/node /var/www/shaun-backend/data-saleslog/run-hourly.js
+ExecStart=/usr/bin/flock -n -E 75 /var/www/shaun-backend/.runtime/saleslogs-sync.lock /usr/bin/flock -w 1200 -E 75 /var/www/shaun-backend/.runtime/clients-sync.lock /usr/bin/flock -w 180 -E 75 /var/www/shaun-backend/.runtime/saleslogs-session.lock /usr/bin/node /var/www/shaun-backend/data-saleslog/run-hourly.js
 SuccessExitStatus=75
