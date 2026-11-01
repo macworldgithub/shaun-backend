@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import httpx
+from bson import ObjectId
 from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
 from cryptography.fernet import Fernet, MultiFernet
@@ -99,12 +100,18 @@ async def authenticate_webhook(request, db):
         raise HTTPException(401, 'Invalid webhook signature')
 
 
+def _json_payload(payload):
+    # Mongo documents contain internal IDs; keep application IDs and encode any
+    # BSON references before persisting or signing integration JSON.
+    return jsonable_encoder(payload, exclude={'_id'}, custom_encoder={ObjectId: str})
+
+
 async def queue_job_event(db, event, job_id, payload):
     now = datetime.now(timezone.utc)
     config = await integration_config(db)
     external = bool(config['outbound_webhook_url'])
     doc = {'id': uuid.uuid4().hex, 'event': event, 'job_id': job_id,
-        'payload': jsonable_encoder(payload), 'status': 'pending' if external else 'local', 'attempts': 0,
+        'payload': _json_payload(payload), 'status': 'pending' if external else 'local', 'attempts': 0,
         'next_attempt_at': now, 'created_at': now}
     await db.contractor_outbox.insert_one(doc)
     await db.contractor_jobs.update_one({'id': job_id}, {'$set': {'outbound_sync_status': 'pending' if external else 'local'}})
@@ -112,7 +119,7 @@ async def queue_job_event(db, event, job_id, payload):
 
 
 async def build_snapshot(db, job):
-    snapshot = jsonable_encoder({k: v for k, v in job.items() if k != '_id'})
+    snapshot = _json_payload(job)
     for field, collection, sort in [('time_logs', 'contractor_time_logs', 'clock_in'),
                                     ('location_history', 'contractor_locations', 'recorded_at'),
                                     ('evidence', 'contractor_evidence', 'captured_at')]:
@@ -121,7 +128,7 @@ async def build_snapshot(db, job):
             clean = {k: v for k, v in doc.items() if k not in ('_id', 'storage_path')}
             if field == 'evidence':
                 clean['download_path'] = f"/api/contractor/jobs/{job['id']}/evidence/{doc['id']}/download"
-            snapshot[field].append(jsonable_encoder(clean))
+            snapshot[field].append(_json_payload(clean))
     snapshot['total_hours'] = round(job.get('total_time_seconds', 0) / 3600, 4)
     return snapshot
 
@@ -310,8 +317,8 @@ async def drain_outbox(db, config=None):
         try:
             job = await db.contractor_jobs.find_one({'id': item['job_id']})
             payload = {'event_id': item['id'], 'event': item['event'], 'job_id': item['job_id'],
-                'payload': await build_snapshot(db, job) if job else item['payload']}
-            body = json.dumps(jsonable_encoder(payload), separators=(',', ':')).encode()
+                'payload': await build_snapshot(db, job) if job else _json_payload(item['payload'])}
+            body = json.dumps(_json_payload(payload), separators=(',', ':')).encode()
             stamp = str(int(time.time()))
             signature = hmac.new(config['webhook_secret'].encode(), stamp.encode() + b'.' + body, hashlib.sha256).hexdigest()
             headers = {'Content-Type': 'application/json', 'Idempotency-Key': item['id'],
