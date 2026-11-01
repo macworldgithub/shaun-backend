@@ -113,6 +113,7 @@ async def list_deals(
     stats.pop('_id', None)
 
     # Pagination
+    skip = (page - 1) * limit
     cursor = (
         db.virtual_yard_deals.find(query, allow_disk_use=True)
         .sort(mongo_sort)
