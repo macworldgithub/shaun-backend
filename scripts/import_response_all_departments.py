@@ -2,6 +2,7 @@
 Existing IDs and staff workflow fields are retained. Live runs require a backup.
 """
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -253,9 +254,36 @@ def protected_hash(documents):
     return hashlib.sha256(json_util.dumps(protected, json_options=json_util.CANONICAL_JSON_OPTIONS, sort_keys=True).encode()).hexdigest()
 
 
-def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None, include_denza=False):
-    json_path = Path(__file__).resolve().parents[1] / 'data-saleslog/response_all_departments.json'
+def validate_fresh_snapshot(payload, now=None):
+    """Scheduled imports accept only a complete, recent fetch of the two BYD sites."""
+    expected = {'BYD Caroline Springs - New': 'memlr9lDsalelogsplusvcg0l581a5',
+                'BYD Nunawading - New': '0JKUwJrlXtMg0l581a5'}
+    if set(payload.get('departments', {})) != set(expected):
+        raise ValueError('A fresh snapshot of exactly the two BYD departments is required.')
+    for name, department_id in expected.items():
+        entry = payload['departments'][name]
+        if entry.get('id') != department_id or not isinstance(entry.get('data', {}).get('list'), list):
+            raise ValueError('Invalid department identity or missing deal list.')
+    stamp = datetime.fromisoformat(str(payload.get('fetchedAt', '')).replace('Z', '+00:00'))
+    if stamp.tzinfo is None:
+        raise ValueError('The snapshot timestamp requires a timezone.')
+    age = ((now or datetime.now(timezone.utc)) - stamp).total_seconds()
+    if age < -60 or age > 7200:
+        raise ValueError('SalesLogs snapshot is stale or dated in the future.')
+    month = str(payload.get('targetMonth', ''))
+    if not re.fullmatch(r'\d{6}', month) or not 1 <= int(month[-2:]) <= 12:
+        raise ValueError('A valid SalesLogs snapshot month is required.')
+    if not any(payload['departments'][name]['data']['list'] for name in expected):
+        raise ValueError('An empty SalesLogs snapshot cannot be imported automatically.')
+
+
+def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None, include_denza=False, input_path=None, require_fresh=False):
+    json_path = Path(input_path).resolve() if input_path else Path(__file__).resolve().parents[1] / 'data-saleslog/response_all_departments.json'
     payload = json.loads(json_path.read_text(encoding='utf-8'))
+    if require_fresh:
+        if include_denza:
+            raise ValueError('Scheduled imports cannot include DENZA.')
+        validate_fresh_snapshot(payload)
     client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=10000, socketTimeoutMS=60000)
     try:
         db = client[DB_NAME]
@@ -277,8 +305,16 @@ def run_import(dry_run=False, backfill_existing_sites=True, backup_path=None, in
             return hashlib.sha256(json_util.dumps(untouched, json_options=json_util.CANONICAL_JSON_OPTIONS, sort_keys=True).encode()).hexdigest()
         before_protected = untouched_hash(documents)
         backup_path = Path(backup_path).resolve()
-        with backup_path.open('x', encoding='utf-8') as handle:
-            handle.write(json_util.dumps({'database': DB_NAME, 'collection': 'clients', 'backedUpAt': datetime.now(timezone.utc), 'documents': documents}, json_options=json_util.CANONICAL_JSON_OPTIONS))
+        backup_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Create privately and exclusively, including compressed hourly backups.
+        descriptor = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'wb') as raw:
+            content = json_util.dumps({'database': DB_NAME, 'collection': 'clients', 'backedUpAt': datetime.now(timezone.utc), 'documents': documents}, json_options=json_util.CANONICAL_JSON_OPTIONS).encode('utf-8')
+            if str(backup_path).endswith('.gz'):
+                with gzip.GzipFile(fileobj=raw, mode='wb') as compressed:
+                    compressed.write(content)
+            else:
+                raw.write(content)
         operations = []
         for key, patch in plan['patches'].items():
             original = plan['original'][key]
@@ -310,6 +346,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--backup')
+    parser.add_argument('--input', help='Fresh snapshot path. Manual imports retain the historical default path.')
+    parser.add_argument('--require-fresh', action='store_true', help='Reject stale, empty, incomplete or non-BYD snapshots before database access.')
     parser.add_argument('--include-denza', action='store_true', help='Explicitly include DENZA rows within the two BYD exports and repair historical DENZA site assignments. The separate DENZA export is always ignored.')
     args = parser.parse_args()
-    run_import(dry_run=args.dry_run, backup_path=args.backup, include_denza=args.include_denza)
+    run_import(dry_run=args.dry_run, backup_path=args.backup, include_denza=args.include_denza, input_path=args.input, require_fresh=args.require_fresh)

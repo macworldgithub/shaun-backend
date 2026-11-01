@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the SalesLogs session every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=1s
+Unit=saleslogs-session.service
+
+[Install]
+WantedBy=timers.target

@@ -1,11 +1,12 @@
 import os
 import unittest
 from copy import deepcopy
+from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
 from bson import ObjectId
 
 with patch.dict(os.environ, {'MONGO_URL': 'mongodb://fixture', 'DB_NAME': 'fixture'}):
-    from scripts.import_response_all_departments import plan_import, protected_hash
+    from scripts.import_response_all_departments import plan_import, protected_hash, validate_fresh_snapshot
 
 CAROLINE = 'BYD Caroline Springs'
 NUNAWADING = 'BYD Nunawading'
@@ -34,6 +35,27 @@ def applied(documents, plan):
 
 
 class SaleslogsDepartmentUpsertTests(unittest.TestCase):
+    def test_scheduled_snapshot_requires_recent_complete_byd_data(self):
+        source = payload([row()], [row('2001')])
+        del source['departments']['Denza Melbourne - New']
+        source['departments']['BYD Caroline Springs - New']['id'] = 'memlr9lDsalelogsplusvcg0l581a5'
+        source['departments']['BYD Nunawading - New']['id'] = '0JKUwJrlXtMg0l581a5'
+        now = datetime.now(timezone.utc)
+        source.update(fetchedAt=now.isoformat(), targetMonth=202611)
+        validate_fresh_snapshot(source, now)
+        stale = {**source, 'fetchedAt': (now - timedelta(hours=3)).isoformat()}
+        with self.assertRaises(ValueError):
+            validate_fresh_snapshot(stale, now)
+        wrong_sites = deepcopy(source)
+        wrong_sites['departments']['Denza Melbourne - New'] = {'data': {'list': [row()]}}
+        with self.assertRaises(ValueError):
+            validate_fresh_snapshot(wrong_sites, now)
+        empty = deepcopy(source)
+        for department in empty['departments'].values():
+            department['data']['list'] = []
+        with self.assertRaises(ValueError):
+            validate_fresh_snapshot(empty, now)
+
     def test_updates_source_values_without_overwriting_ids_or_staff_workflow(self):
         document = {'_id': ObjectId(), 'id': 'existing-uuid', 'site_location': CAROLINE,
                     'vy_order_id': 'ORDER1', 'name': 'Old Name', 'phone': '0400000000',

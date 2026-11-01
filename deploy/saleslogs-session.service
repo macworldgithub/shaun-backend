@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew and persist the SalesLogs authenticated session
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/www/shaun-backend
+Environment=NODE_ENV=production
+UMask=0077
+TimeoutStartSec=3min
+ExecStart=/usr/bin/flock -n -E 75 /var/www/shaun-backend/.runtime/saleslogs-session.lock /usr/bin/node /var/www/shaun-backend/data-saleslog/session.js
+SuccessExitStatus=75

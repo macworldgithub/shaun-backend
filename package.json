@@ -4,6 +4,10 @@
   "private": true,
   "description": "BYD Contractor Backend (FastAPI)",
   "scripts": {
+    "saleslogs:fetch": "node data-saleslog/index.js",
+    "saleslogs:sync": "node data-saleslog/run-hourly.js",
+    "saleslogs:renew": "node data-saleslog/session.js",
+    "test:saleslogs": "node --test tests/saleslogs-*.test.cjs",
     "start": "./venv/bin/uvicorn server:app --port 8000",
     "start:dev": "./venv/bin/uvicorn server:app --reload --port 8000",
     "dev": "./venv/bin/uvicorn server:app --reload --port 8000"

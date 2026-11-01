@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the BYD SalesLogs sync every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1s
+Unit=saleslogs-sync.service
+
+[Install]
+WantedBy=timers.target
