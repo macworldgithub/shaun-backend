@@ -23,10 +23,20 @@ staff checklists are preserved. Empty source values do not erase enriched values
 VINs are copied only through a unique source stock/registration/slug match.
 Other dealerships and records from other importers are not updated.
 
-Every live import requires a private compressed backup of clients and the raw
-source collection. Writes have optimistic concurrency guards. Verification checks
+Every live import requires a private compressed backup of the Denza Dealer Studio
+clients it can edit and the raw source collection. Unrelated client records are
+excluded from database reads and cannot match the write guards. Writes have optimistic concurrency guards. Verification checks
 the source snapshots, unaffected records and a second client import with zero
 remaining changes. Ambiguous existing IDs fail before writes.
+
+Database reads use compressed transport and bounded, ordered `_id` pages. A lost
+connection retries the incomplete page without duplicating already-read records.
+Writes use batches of at most 50 operations. The runner plans inside the guarded
+importer rather than downloading the same collections for a redundant dry run.
+Transient database failures retry the importer up to three times, re-reading the
+current state and creating a new backup each time. Validation and identity
+conflicts are not retried. `database-progress.json` records the current stage and
+completed batch counts without customer data.
 
 ```sh
 venv/bin/python scripts/import_dealerstudio.py --input /var/www/dealer-studio-byd/.runtime/sync/data --require-fresh --dry-run

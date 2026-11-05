@@ -4,8 +4,10 @@ import unittest
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from unittest.mock import patch
 from bson import ObjectId
-from scripts.import_dealerstudio import plan_clients, read_snapshot, raw_documents
+from pymongo.errors import NetworkTimeout
+from scripts.import_dealerstudio import plan_clients, read_snapshot, raw_documents, read_documents, CLIENT_SCOPE
 
 
 def row(key=101, **changes):
@@ -24,6 +26,62 @@ def apply(documents, plan):
 
 
 class DealerStudioUpsertTests(unittest.TestCase):
+    def test_read_retry_resumes_after_last_complete_page_without_duplicate_rows(self):
+        class Cursor:
+            def __init__(self, rows, fail=False): self.rows, self.fail = rows, fail
+            def sort(self, *args): return self
+            def limit(self, *args): return self
+            def batch_size(self, *args): return self
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def __iter__(self):
+                for index, doc in enumerate(self.rows):
+                    yield doc
+                    if self.fail and index == 0: raise NetworkTimeout('fixture interrupted cursor')
+        class Collection:
+            def __init__(self): self.calls = []
+            def find(self, query):
+                self.calls.append(query)
+                if len(self.calls) == 1: return Cursor([{'_id': 1}, {'_id': 2}])
+                return Cursor([{'_id': 3}], fail=len(self.calls) == 2)
+        collection = Collection()
+        query = {'_id': {'$in': [1, 2, 3]}, 'dealership_id': '2606'}
+        with patch('scripts.import_dealerstudio.time.sleep') as sleep:
+            result = read_documents(collection, query, batch_size=2)
+        self.assertEqual([doc['_id'] for doc in result], [1, 2, 3])
+        self.assertEqual(collection.calls[1], collection.calls[2])
+        self.assertEqual(collection.calls[2]['$and'], [query, {'_id': {'$gt': 2}}])
+        sleep.assert_called_once_with(1)
+
+    def test_repeated_network_failure_has_a_bounded_retry_limit(self):
+        class Collection:
+            def __init__(self): self.calls = 0
+            def find(self, query):
+                self.calls += 1
+                raise NetworkTimeout('fixture database unreachable')
+        collection = Collection()
+        with patch('scripts.import_dealerstudio.time.sleep'):
+            with self.assertRaises(NetworkTimeout): read_documents(collection, {})
+        self.assertEqual(collection.calls, 3)
+
+    def test_database_scope_excludes_other_sites_and_importers(self):
+        import re
+        def matches(doc, query):
+            if '$or' in query and not any(matches(doc, part) for part in query['$or']): return False
+            for key, condition in query.items():
+                if key == '$or': continue
+                value = doc.get(key)
+                if isinstance(condition, dict):
+                    if '$in' in condition and value not in condition['$in']: return False
+                    if '$regex' in condition and not re.search(condition['$regex'], value or '', re.I): return False
+                elif value != condition: return False
+            return True
+        self.assertTrue(matches({'imported_from': 'dealer_studio', 'site_location': 'Denza Melbourne'}, CLIENT_SCOPE))
+        self.assertTrue(matches({'imported_from': 'dealer_studio', 'site': 'Denza Melbourne'}, CLIENT_SCOPE))
+        self.assertTrue(matches({'imported_from': 'dealer_studio', 'site_location': ' DENZA-MELBOURNE '}, CLIENT_SCOPE))
+        self.assertFalse(matches({'imported_from': 'saleslogs-csv', 'site_location': 'Denza Melbourne'}, CLIENT_SCOPE))
+        self.assertFalse(matches({'imported_from': 'dealer_studio', 'site_location': 'BYD Melbourne', 'site': 'Denza Melbourne'}, CLIENT_SCOPE))
+
     def test_existing_identity_staff_workflow_and_communication_fields_survive(self):
         doc = {'_id': ObjectId(), 'id': 'saved-id', 'imported_from': 'dealer_studio', 'site_location': 'Denza Melbourne',
                'vy_order_id': '101', 'name': 'Old name', 'stage': 'Ready for Pickup', 'documents': [{'id': 'saved-doc'}],

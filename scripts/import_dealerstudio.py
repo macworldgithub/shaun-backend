@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bson import ObjectId, json_util
 from dotenv import load_dotenv
 from pymongo import MongoClient, UpdateOne
+from pymongo.errors import AutoReconnect, CursorNotFound
 from models import Client
 
 SITE = 'Denza Melbourne'
@@ -22,6 +24,44 @@ SLUG = 'denza-melbourne'
 DEALERSHIP = '2606'
 ELIGIBLE = {'contract signed', 'vehicle order', 'delivered'}
 RAW_COLLECTION = 'dealerstudio_records'
+CLIENT_SCOPE = {'imported_from': 'dealer_studio', '$or': [
+    {'site_location': {'$regex': r'^[^a-z0-9]*denza[^a-z0-9]*melbourne[^a-z0-9]*$', '$options': 'i'}},
+    {'site_location': {'$in': [None, '']}, 'site': {'$regex': r'^[^a-z0-9]*denza[^a-z0-9]*melbourne[^a-z0-9]*$', '$options': 'i'}},
+]}
+
+
+def record_progress(path, stage, **values):
+    if not path:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf8') as handle:
+        json.dump({'stage': stage, 'updatedAt': datetime.now(timezone.utc).isoformat(), **values}, handle)
+    os.replace(temporary, path)
+
+
+def read_documents(collection, query, progress=None, stage='reading', batch_size=100):
+    """Resume at the last complete _id page instead of restarting a whole cursor."""
+    documents, last_id = [], None
+    while True:
+        page_query = query if last_id is None else {'$and': [query, {'_id': {'$gt': last_id}}]}
+        for attempt in range(3):
+            try:
+                with collection.find(page_query).sort('_id', 1).limit(batch_size).batch_size(batch_size) as cursor:
+                    page = list(cursor)
+                break
+            except (AutoReconnect, CursorNotFound):
+                record_progress(progress, stage, records=len(documents), read_retry=attempt + 1)
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+        documents.extend(page)
+        record_progress(progress, stage, records=len(documents))
+        if len(page) < batch_size:
+            return documents
+        last_id = page[-1]['_id']
 
 
 def digest(value):
@@ -169,16 +209,18 @@ def hash_documents(rows):
         json_options=json_util.CANONICAL_JSON_OPTIONS, sort_keys=True).encode()).hexdigest()
 
 
-def run_import(directory, dry_run=False, backup=None, require_fresh=False):
+def run_import(directory, dry_run=False, backup=None, require_fresh=False, progress=None):
+    record_progress(progress, 'validating_snapshot')
     snapshot = read_snapshot(directory, require_fresh)
     load_dotenv(Path(__file__).resolve().parents[1] / '.env')
-    with MongoClient(os.environ['MONGO_URL'], serverSelectionTimeoutMS=10000, socketTimeoutMS=60000) as mongo:
+    with MongoClient(os.environ['MONGO_URL'], serverSelectionTimeoutMS=10000, socketTimeoutMS=60000,
+                     compressors=['zlib']) as mongo:
         db = mongo[os.environ.get('DB_NAME', 'test_database')]
-        clients = list(db.clients.find({}).batch_size(100))
+        clients = read_documents(db.clients, CLIENT_SCOPE, progress, 'reading_denza_clients')
         plan = plan_clients(snapshot['leads'], snapshot['cars'], clients)
         # Two logical models share one physical collection to fit Atlas collection quotas.
         sources = {RAW_COLLECTION: [*raw_documents(snapshot['leads'], 'lead'), *raw_documents(snapshot['cars'], 'car')]}
-        old = {name: list(db[name].find({}).batch_size(100)) for name in sources}
+        old = {name: read_documents(db[name], {}, progress, 'reading_source_records') for name in sources}
         raw_changes = {}
         for name, incoming in sources.items():
             previous = {d['_id']: d for d in old[name]}
@@ -191,7 +233,8 @@ def run_import(directory, dry_run=False, backup=None, require_fresh=False):
                     raw_changes[name].append(row)
         summary = {'database': db.name, 'site': SITE, 'dry_run': dry_run, 'counts': plan['counts'], 'conflicts': plan['conflicts'],
                    'source_counts': {'leads': len(snapshot['leads']), 'inventory': len(snapshot['cars'])},
-                   'storage_collection': RAW_COLLECTION, 'raw_upserts': {name: len(rows) for name, rows in raw_changes.items()}}
+                   'storage_collection': RAW_COLLECTION, 'backup_scope': 'denza_dealerstudio_clients_and_source_records',
+                   'raw_upserts': {name: len(rows) for name, rows in raw_changes.items()}}
         if plan['conflicts']:
             raise ValueError('Duplicate Denza source identities must be resolved before importing.')
         if dry_run:
@@ -199,6 +242,7 @@ def run_import(directory, dry_run=False, backup=None, require_fresh=False):
         if not backup:
             raise ValueError('A private pre-import backup is required.')
         backup = Path(backup).resolve()
+        record_progress(progress, 'creating_backup')
         backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'wb') as handle, gzip.GzipFile(fileobj=handle, mode='wb') as compressed:
@@ -216,33 +260,41 @@ def run_import(directory, dry_run=False, backup=None, require_fresh=False):
         for doc in plan['inserts'].values():
             operations.append(UpdateOne({'_id': doc['_id']}, {'$setOnInsert': doc}, upsert=True))
         modified = inserted = 0
-        for start in range(0, len(operations), 300):
-            result = db.clients.bulk_write(operations[start:start + 300], ordered=True)
+        record_progress(progress, 'writing_clients', operations=len(operations))
+        for start in range(0, len(operations), 50):
+            result = db.clients.bulk_write(operations[start:start + 50], ordered=True)
             modified += result.modified_count
             inserted += result.upserted_count
+            record_progress(progress, 'writing_clients', completed=min(start + 50, len(operations)), operations=len(operations))
         if modified != len(plan['patches']) or inserted != len(plan['inserts']):
             raise RuntimeError('A client changed concurrently. The partial result requires a fresh verification.')
         for name, rows in raw_changes.items():
             ops = [UpdateOne({'_id': row['_id'], 'dealership_id': DEALERSHIP}, {'$set': {**{k: v for k, v in row.items() if k != '_id'}, 'updated_at': datetime.now(timezone.utc)},
                 '$setOnInsert': {'created_at': datetime.now(timezone.utc)}}, upsert=True) for row in rows]
-            for start in range(0, len(ops), 300):
-                db[name].bulk_write(ops[start:start + 300], ordered=True)
-        after = list(db.clients.find({}).batch_size(100))
+            record_progress(progress, 'writing_source_records', operations=len(ops))
+            for start in range(0, len(ops), 50):
+                db[name].bulk_write(ops[start:start + 50], ordered=True)
+                record_progress(progress, 'writing_source_records', completed=min(start + 50, len(ops)), operations=len(ops))
+        after = read_documents(db.clients, CLIENT_SCOPE, progress, 'verifying_clients')
         if hash_documents([d for d in after if d['_id'] in untouched_ids]) != protected_before:
             raise RuntimeError('Unrelated clients changed during the sync; investigate concurrent changes.')
         check = plan_clients(snapshot['leads'], snapshot['cars'], after)
         if check['patches'] or check['inserts'] or check['conflicts']:
             raise RuntimeError('The client upsert did not pass second-run verification.')
         for name, rows in sources.items():
-            actual = {d['_id']: d for d in db[name].find({'_id': {'$in': [r['_id'] for r in rows]}})}
+            actual = {d['_id']: d for d in read_documents(db[name], {'_id': {'$in': [r['_id'] for r in rows]}}, progress, 'verifying_source_records')}
             if any(actual.get(r['_id'], {}).get('source_data') != r['source_data'] for r in rows):
                 raise RuntimeError('Raw Dealer Studio snapshot verification failed.')
             changed_ids = {r['_id'] for r in raw_changes[name]}
             protected = [r for r in old[name] if r['_id'] not in changed_ids]
             if protected:
-                current = list(db[name].find({'_id': {'$in': [r['_id'] for r in protected]}}))
+                current = [actual[r['_id']] for r in protected if r['_id'] in actual]
+                absent_ids = [r['_id'] for r in protected if r['_id'] not in actual]
+                if absent_ids:
+                    current.extend(read_documents(db[name], {'_id': {'$in': absent_ids}}, progress, 'verifying_protected_records'))
                 if hash_documents(current) != hash_documents(protected):
                     raise RuntimeError('Unrelated raw snapshot records changed during the sync.')
+        record_progress(progress, 'verified', modified_clients=modified, inserted_clients=inserted)
         return {**summary, 'verified': True, 'modified_clients': modified, 'inserted_clients': inserted,
                 'protected_records_unchanged': True, 'second_run_changes': 0, 'backup': str(backup)}
 
@@ -253,9 +305,10 @@ if __name__ == '__main__':
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--backup')
     parser.add_argument('--require-fresh', action='store_true')
+    parser.add_argument('--progress', help='Private progress receipt for the scheduled job.')
     args = parser.parse_args()
     try:
-        print(json.dumps(run_import(args.input, args.dry_run, args.backup, args.require_fresh)))
+        print(json.dumps(run_import(args.input, args.dry_run, args.backup, args.require_fresh, args.progress)))
     except Exception as error:
         print(json.dumps({'status': 'failed', 'error': type(error).__name__, 'database_code': getattr(error, 'code', None),
                           'message': str(error) if isinstance(error, (ValueError, RuntimeError)) else 'Dealer Studio database import failed.'}))
