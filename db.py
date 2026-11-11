@@ -58,18 +58,16 @@ async def ensure_indexes():
     await safe_index(db.users, 'id')
     await safe_index(db.clients, 'id')
     await safe_index(db.clients, 'vy_order_id')
-    await safe_index(db.clients, 'assigned_agent_id')
+    # Compound indexes below also cover their leading-field/prefix queries.
+    # Avoid rebuilding redundant indexes on the storage-limited shared cluster.
     await safe_index(db.clients, 'contact_status')
     await safe_index(db.clients, 'stage')
-    await safe_index(db.clients, 'delivery_date')
     # Estimated bookings do not consume capacity. Atomic uniqueness prevents two
     # staff members confirming the same site/date/time concurrently.
     from services.delivery_booking import ensure_booking_index
     await ensure_booking_index(db)
-    await safe_index(db.clients, [('delivery_date', 1), ('created_at', -1)])
     await safe_index(db.clients, [('delivery_date', 1), ('created_at', -1), ('id', 1)])
     await safe_index(db.clients, [('created_at', -1)])
-    await safe_index(db.clients, [('site_location', 1), ('delivery_date', 1), ('created_at', -1)])
     await safe_index(db.clients, [('site_location', 1), ('delivery_date', 1), ('created_at', -1), ('id', 1)])
     await safe_index(db.clients, [('assigned_agent_id', 1), ('delivery_date', 1), ('created_at', -1)])
     await safe_index(db.messages, [('client_id', 1), ('sent_at', -1)])
