@@ -14,7 +14,7 @@ def _id() -> str:
 
 UserRole = Literal[
     'super_admin', 'admin', 'agent', 'contractor',
-    'manager', 'sales_manager', 'sales_consultant', 'consultant', 'bdc', 'delivery', 'site_admin', 'delivery_consultant'
+    'manager', 'sales_manager', 'sales_consultant', 'consultant', 'bdc', 'delivery', 'site_admin', 'delivery_consultant', 'delivery_specialist'
 ]
 
 
@@ -162,6 +162,8 @@ class ClientBase(BaseModel):
     document_completeness: DocumentCompleteness = 'Requested'
     deal_type: Optional[str] = None
     delivery_date: Optional[str] = None  # ISO yyyy-mm-dd
+    booking_type: Literal['estimated', 'confirmed'] = 'estimated'
+    delivery_time: Optional[str] = None  # Site-local HH:MM
     stage: DeliveryStage = 'Scheduled'
     salesperson: Optional[str] = None
     secondary_salesperson: Optional[str] = None
@@ -343,6 +345,8 @@ class ClientUpdate(BaseModel):
     offer_status: Optional[OfferStatus] = None
     offer_reason: Optional[str] = None
     delivery_date: Optional[str] = None
+    booking_type: Optional[Literal['estimated', 'confirmed']] = None
+    delivery_time: Optional[str] = None
     stage: Optional[DeliveryStage] = None
     salesperson: Optional[str] = None
     notes: Optional[str] = None

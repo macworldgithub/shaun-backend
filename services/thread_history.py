@@ -3,6 +3,8 @@ import re
 from datetime import datetime, timezone
 from fastapi import HTTPException
 from db import get_db, get_lead_db
+import logging
+import asyncio
 
 def phone_key(value):
     digits = re.sub(r'\D', '', str(value or ''))
@@ -15,9 +17,13 @@ def site_key(value):
 def allowed_site(user, site):
     if user.role == 'contractor':
         return False
-    if user.locked_site:
-        return bool(site_key(site)) and site_key(site) == site_key(user.locked_site)
-    if user.role in ('super_admin', 'admin'):
+    locked = getattr(user, 'request_site', None) or user.locked_site
+    if locked:
+        return bool(site_key(site)) and site_key(site) == site_key(locked)
+    sites = getattr(user, 'allowed_sites', None)
+    if sites is not None and not getattr(user, 'all_sites', False):
+        return bool(site_key(site)) and any(site_key(site) == site_key(s) for s in sites)
+    if user.role in ('super_admin', 'admin', 'site_admin', 'delivery_specialist'):
         return True
     return bool(site_key(user.active_site)) and site_key(site) == site_key(user.active_site)
 
@@ -46,7 +52,10 @@ def merge_rows(rows):
 
 async def history(user, client_id=None, requested_site=None, limit=200, phone=None):
     db = get_db()
-    lead_db = get_lead_db()
+    try:
+        lead_db = get_lead_db()
+    except RuntimeError:
+        lead_db = None
     from services.sms_event import phone_pattern
     target = None
     if client_id:
@@ -63,8 +72,15 @@ async def history(user, client_id=None, requested_site=None, limit=200, phone=No
         c['site_location'] = c.get('site_location') or c.get('site')
     if target:
         target['site_location'] = target.get('site_location') or target.get('site')
-    conversations = await lead_db.conversations.find(query).to_list(None)
-    leads = await lead_db.leads.find(query, {'phone': 1, 'dealer': 1, 'name': 1}).to_list(None)
+    conversations, leads = [], []
+    if lead_db is not None:
+        try:
+            conversations, leads = await asyncio.wait_for(asyncio.gather(
+                lead_db.conversations.find(query).to_list(None),
+                lead_db.leads.find(query, {'phone': 1, 'dealer': 1, 'name': 1}).to_list(None),
+            ), timeout=1.5)
+        except Exception:
+            logging.getLogger(__name__).warning('Shared history unavailable; serving Delivery Centre messages', exc_info=True)
     records = clients + [{**l, 'site_location': l.get('dealer')} for l in leads]
     messages = await db.messages.find(query).to_list(None)
     out = []

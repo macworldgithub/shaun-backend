@@ -12,6 +12,7 @@ import httpx
 from io import BytesIO
 from PIL import Image
 from pydantic import TypeAdapter
+from pymongo.errors import DuplicateKeyError
 from starlette.concurrency import run_in_threadpool
 
 from db import get_db
@@ -27,6 +28,7 @@ from services.storage import put_bytes, get_bytes, exists
 from services.inspection_pdf import generate_inspection_pdf
 from services.crm_webhook import dispatch_crm_webhook
 from services.contractor_service import sync_client_updates_to_contractor_jobs
+from services.delivery_booking import booking_key, validate_day, SLOT_TIMES, slot_conflict
 
 router = APIRouter(prefix='/api/clients', tags=['clients'])
 
@@ -34,6 +36,7 @@ router = APIRouter(prefix='/api/clients', tags=['clients'])
 CLIENT_PROJECTION = {field: 1 for field in Client.model_fields}
 CLIENT_PROJECTION['_id'] = 0
 CLIENT_LIST_ADAPTER = TypeAdapter(List[Client])
+SUMMARY_FIELDS = set('id name phone email vehicle rego vin delivery_date delivery_time booking_type stage salesperson secondary_salesperson delivery_consultant handover_specialist site_location assigned_agent_id contact_status arrived location pdi_complete payment_complete trade_in_flag trade_in_attached trade_in_docs_complete trade_in_status registration_docs_complete registration_status document_completeness ready_for_delivery offer_status trade_in_valid_until created_at'.split())
 
 
 def _accepts_gzip(accept_encoding):
@@ -52,11 +55,11 @@ def _accepts_gzip(accept_encoding):
     return encodings.get('gzip', encodings.get('*', 0)) > 0
 
 
-def _client_list_response(rows, accept_encoding=''):
+def _client_list_response(rows, accept_encoding='', summary=False):
     # Validate business rules once and encode directly to JSON bytes. Running this
     # in a worker keeps large lists from blocking unrelated API requests.
     clients = CLIENT_LIST_ADAPTER.validate_python(rows)
-    body = CLIENT_LIST_ADAPTER.dump_json(clients)
+    body = CLIENT_LIST_ADAPTER.dump_json(clients, include={'__all__': SUMMARY_FIELDS} if summary else None)
     headers = {'Vary': 'Accept-Encoding'}
     if len(body) >= 1000 and _accepts_gzip(accept_encoding):
         body = gzip.compress(body, compresslevel=5)
@@ -264,9 +267,20 @@ async def list_clients(
     site_location: Optional[str] = None,
     limit: Annotated[int, Query(ge=1, le=5000)] = 5000,
     offset: Annotated[int, Query(ge=0)] = 0,
+    summary: bool = False,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
 ):
     db = get_db()
     q: dict = {}
+    if date_from or date_to:
+        q['delivery_date'] = {}
+        if date_from:
+            q['delivery_date']['$gte'] = validate_day(date_from)
+        if date_to:
+            q['delivery_date']['$lte'] = validate_day(date_to)
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, 'Start date must not be after end date')
     if stage:
         q['stage'] = stage
     if contact_status:
@@ -285,7 +299,7 @@ async def list_clients(
         escaped = re.escape(clean_site)
         q['site_location'] = {'$regex': f'^{escaped}$', '$options': 'i'}
     if search:
-        regex = {'$regex': search, '$options': 'i'}
+        regex = {'$regex': re.escape(search), '$options': 'i'}
         search_filter = {'$or': [
             {'name': regex}, {'phone': regex}, {'vehicle': regex},
             {'rego': regex}, {'vy_order_id': regex}, {'email': regex},
@@ -293,7 +307,7 @@ async def list_clients(
         # Search narrows the selected assignment filter instead of widening it.
         q.setdefault('$and', []).append(search_filter)
     cursor = (
-        db.clients.find(q, CLIENT_PROJECTION, allow_disk_use=True)
+        db.clients.find(q, {**dict.fromkeys(SUMMARY_FIELDS, 1), '_id': 0} if summary else CLIENT_PROJECTION, allow_disk_use=True)
         .sort([('delivery_date', 1), ('created_at', -1)])
         .allow_disk_use(True)
         .skip(offset)
@@ -302,7 +316,7 @@ async def list_clients(
     )
     rows = await cursor.to_list(length=limit)
     accept_encoding = request.headers.get('accept-encoding', '') if request else ''
-    return await run_in_threadpool(_client_list_response, rows, accept_encoding)
+    return await run_in_threadpool(_client_list_response, rows, accept_encoding, summary)
 
 
 @router.post('', response_model=Client, status_code=status.HTTP_201_CREATED)
@@ -322,13 +336,39 @@ async def create_client(payload: ClientBase, user: User = Depends(get_current_us
     client = Client(**payload.model_dump())
     if effective_site(user):
         client.site_location = effective_site(user)
-    await db.clients.insert_one(client.model_dump(mode='json'))
+    record = client.model_dump(mode='json')
+    record['delivery_slot_key'] = booking_key(record)
+    try:
+        await db.clients.insert_one(record)
+    except DuplicateKeyError:
+        raise slot_conflict()
     return client
 
 
 # ---------------------------------------------------------------------------
 # Clients — static sub-collection routes  (must precede /{client_id})
 # ---------------------------------------------------------------------------
+
+@router.get('/available-slots')
+async def available_slots(day: str, site_location: Optional[str] = None,
+                          exclude_client_id: Optional[str] = None,
+                          user: User = Depends(get_current_user)):
+    validate_day(day)
+    site = effective_site(user, site_location)
+    from services.account_access import site_key
+    if not site or site_key(site) in ('all', 'allsites'):
+        raise HTTPException(422, 'Choose a delivery site to see available times')
+    # Include aliases such as BYD Fairfield / Fairfield when checking occupancy.
+    rows = await get_db().clients.find(
+        {'delivery_date': day, 'booking_type': 'confirmed'},
+        {'id': 1, 'site_location': 1, 'delivery_time': 1, '_id': 0},
+    ).to_list(None)
+    occupied = {row.get('delivery_time') for row in rows
+                if site_key(row.get('site_location')) == site_key(site)
+                and row.get('id') != exclude_client_id}
+    return {'day': day, 'site_location': site, 'slots': [
+        {'time': time, 'available': time not in occupied} for time in SLOT_TIMES
+    ]}
 
 @router.get('/alerts')
 async def client_alerts(user: User = Depends(get_current_user)):
@@ -472,7 +512,14 @@ async def bulk_import(items: List[ClientBase], user: User = Depends(get_current_
         data['imported_from'] = data.get('imported_from') or 'paste'
         data['imported_at'] = datetime.now(timezone.utc)
         client = Client(**data)
-        await db.clients.insert_one(client.model_dump(mode='json'))
+        if effective_site(user):
+            client.site_location = effective_site(user)
+        record = client.model_dump(mode='json')
+        record['delivery_slot_key'] = booking_key(record)
+        try:
+            await db.clients.insert_one(record)
+        except DuplicateKeyError:
+            raise slot_conflict()
         created.append(client)
     return created
 
@@ -753,11 +800,18 @@ async def update_client(
     update = {
         k: v
         for k, v in payload.model_dump(exclude_unset=True).items()
-        if v is not None or k in ('assigned_agent_id', 'aftermarket_notes', 'address', 'location', 'email', 'salesperson')
+        if v is not None or k in ('assigned_agent_id', 'aftermarket_notes', 'address', 'location', 'email', 'salesperson', 'delivery_time', 'delivery_date')
     }
     existing = await db.clients.find_one({'id': client_id})
     if not existing:
         raise HTTPException(404, 'Client not found')
+    assert_site_access(user, existing)
+    if effective_site(user) and 'site_location' in update:
+        update['site_location'] = effective_site(user)
+    booking_fields = {'delivery_date', 'delivery_time', 'booking_type', 'site_location'}
+    booking_changed = bool(booking_fields & update.keys())
+    if booking_changed:
+        update['delivery_slot_key'] = booking_key({**existing, **update})
     _validate_sale_type(
         update.get('sale_type', existing.get('sale_type', 'Retail')),
         update.get('fleet_company', existing.get('fleet_company')),
@@ -809,7 +863,7 @@ async def update_client(
     ):
         if not update.get('trade_in_manager_reason'):
             raise HTTPException(400, 'A manager reason is required to settle an expired trade-in')
-        if user.role not in ('admin', 'super_admin'):
+        if user.role not in ('admin', 'super_admin', 'site_admin', 'delivery_specialist'):
             raise HTTPException(403, 'Only a manager can settle an expired trade-in')
     if 'arrived' in update and update['arrived'] is True:
         update['arrived_at'] = datetime.now(timezone.utc)
@@ -826,10 +880,20 @@ async def update_client(
     update['ready_for_delivery'] = bool(payment_ok and trade_in_ok and pdi_ok and rego_ok)
 
     update['updated_at'] = datetime.now(timezone.utc)
-    res = await db.clients.find_one_and_update(
-        {'id': client_id}, {'$set': update}, return_document=True,
-    )
+    match = {'id': client_id}
+    if booking_changed:
+        # Two concurrent edits to the same customer must not leave date/time and
+        # the unique reservation key describing different slots.
+        match.update({field: existing.get(field) for field in booking_fields})
+    try:
+        res = await db.clients.find_one_and_update(
+            match, {'$set': update}, return_document=True,
+        )
+    except DuplicateKeyError:
+        raise slot_conflict()
     if not res:
+        if booking_changed:
+            raise HTTPException(409, 'This booking changed while you were editing. Refresh and try again.')
         raise HTTPException(404, 'Client not found')
 
     # Emit Delivery Stage Changed Webhook to Sales CRM (§5.8, §8.3, AC-9)
@@ -1231,7 +1295,7 @@ async def update_trade_in(
             payload['trade_in_status'] == 'Settled'
             and valid_until
             and valid_until < datetime.now(timezone.utc).date().isoformat()
-            and user.role not in ('admin', 'super_admin')
+            and user.role not in ('admin', 'super_admin', 'site_admin', 'delivery_specialist')
         ):
             raise HTTPException(403, 'Only a manager can settle an expired trade-in')
     if 'trade_in_manager_reason' in payload:
@@ -1268,7 +1332,7 @@ async def update_activation_gate(
         raise HTTPException(400, 'Invalid activation status')
     override_reason = payload.get('activation_override_reason')
     if activating and not handover and (
-        user.role not in ('admin', 'super_admin') or not override_reason
+        user.role not in ('admin', 'super_admin', 'site_admin', 'delivery_specialist') or not override_reason
     ):
         raise HTTPException(
             400, 'Activation cannot be set to Ready while handover checklist is not on file'

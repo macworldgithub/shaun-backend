@@ -169,9 +169,9 @@ def test_large_list_encoding_runs_outside_event_loop(monkeypatch):
     threads = []
     original = module._client_list_response
 
-    def encode(rows, accept_encoding):
+    def encode(rows, accept_encoding, summary=False):
         threads.append(threading.get_ident())
-        return original(rows, accept_encoding)
+        return original(rows, accept_encoding, summary)
 
     monkeypatch.setattr(module, '_client_list_response', encode)
     collection = Collection([record('one')])

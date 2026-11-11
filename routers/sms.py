@@ -3,6 +3,8 @@ from fastapi.responses import JSONResponse
 from typing import Optional, List
 from datetime import datetime, timezone
 import uuid
+import logging
+import asyncio
 
 from db import get_db, get_lead_db
 from services.thread_history import history, assert_message_access, phone_key, allowed_site, site_key
@@ -15,6 +17,15 @@ from auth import get_current_user, require_admin
 from mobilemessage import send_sms, render_template, normalise_au
 
 router = APIRouter(prefix='/api', tags=['sms'])
+log = logging.getLogger(__name__)
+
+
+def optional_lead_db():
+    # Delivery Centre replies must work even when the Lead Centre is unconfigured.
+    try:
+        return get_lead_db()
+    except RuntimeError:
+        return None
 
 
 def _strip(d):
@@ -193,19 +204,35 @@ async def mobilemessage_inbound(request: Request):
     except Exception:
         raise HTTPException(400, 'Invalid JSON')
 
-    event_type = (payload.get('type') or '').lower()
-    is_inbound = event_type in ('inbound', 'unsubscribe') or bool((payload.get('message') or payload.get('text') or payload.get('body')) and (payload.get('from') or payload.get('sender') or payload.get('phone')))
+    if not isinstance(payload, dict):
+        raise HTTPException(400, 'Expected a JSON object')
+    event_type = str(payload.get('type') or '').lower()
+    # Delivery receipts also contain sender + message. Test status first so they
+    # cannot masquerade as replies or overwrite contact state.
+    is_receipt = bool(payload.get('status')) and event_type not in ('inbound', 'unsubscribe')
+    is_inbound = not is_receipt and (event_type in ('inbound', 'unsubscribe') or bool((payload.get('message') or payload.get('text') or payload.get('body')) and (payload.get('from') or payload.get('sender') or payload.get('phone'))))
 
     if is_inbound:
         from_phone = normalise_au(payload.get('from') or payload.get('sender') or payload.get('phone') or '')
         body = str(payload.get('message') or payload.get('body') or payload.get('text') or '').strip()
         if not from_phone or not body:
             raise HTTPException(400, 'Missing phone or message body')
-        leads = await get_lead_db().leads.find({'phone': {'$regex': phone_pattern(from_phone)}}).to_list(None)
+        lead_db = optional_lead_db()
+        leads = []
+        if lead_db is not None:
+            try:
+                leads = await asyncio.wait_for(lead_db.leads.find({'phone': {'$regex': phone_pattern(from_phone)}}).to_list(None), timeout=1.0)
+            except Exception:
+                log.warning('Lead Centre lookup unavailable; saving Delivery Centre reply', exc_info=True)
         clients = await db.clients.find({'phone': {'$regex': phone_pattern(from_phone)}}).to_list(None)
         original_id = payload.get('original_message_id')
         original = await db.messages.find_one({'provider_message_id': original_id, 'direction': 'outbound'}) if original_id else None
-        source = await get_lead_db().conversations.find_one({'messages': {'$elemMatch': {'id': original_id, 'sender': {'$ne': 'user'}}}}) if original_id else None
+        source = None
+        if original_id and lead_db is not None:
+            try:
+                source = await asyncio.wait_for(lead_db.conversations.find_one({'messages': {'$elemMatch': {'id': original_id, 'sender': {'$ne': 'user'}}}}), timeout=1.0)
+            except Exception:
+                log.warning('Lead Centre correlation unavailable', exc_info=True)
         site = inbound_site(original, source, leads, clients)
         client_doc = next((c for c in clients if site and site_key(c.get('site_location') or c.get('site')) == site_key(site)), None)
 
@@ -241,15 +268,21 @@ async def mobilemessage_inbound(request: Request):
 
     # Delivery receipt path
     message_id = payload.get('message_id')
+    if not is_receipt or not message_id:
+        raise HTTPException(400, 'Missing inbound message or delivery receipt')
     status_val = (payload.get('status') or 'unknown').lower()
     if message_id:
         await db.messages.update_many(
-            {'provider_message_id': message_id},
+            {'provider_message_id': message_id, 'direction': 'outbound'},
             {'$set': {
                 'status': status_val,
                 'provider_response': payload,
             }},
         )
-    if message_id:
-        await get_lead_db().conversations.update_many({'messages.id': message_id}, {'$set': {'messages.$[m].status': status_val}}, array_filters=[{'m.id': message_id}])
+    lead_db = optional_lead_db()
+    if lead_db is not None:
+        try:
+            await asyncio.wait_for(lead_db.conversations.update_many({'messages.id': message_id}, {'$set': {'messages.$[m].status': status_val}}, array_filters=[{'m.id': message_id}]), timeout=1.0)
+        except Exception:
+            log.warning('Lead Centre delivery receipt sync unavailable', exc_info=True)
     return {'success': True, 'event': 'status', 'status': status_val}

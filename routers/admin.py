@@ -39,7 +39,7 @@ async def _editable_user(db, uid):
 async def list_users(
     role: Optional[str] = None,
     active_only: bool = False,
-    _: User = Depends(require_user_manager)
+    _: User = Depends(require_admin)
 ):
     db = get_db()
     query = {}
@@ -141,104 +141,8 @@ async def stats(
     site_location: Optional[str] = None,
     user: User = Depends(get_current_user)
 ):
-    site_location = effective_site(user, site_location)
-    db = get_db()
-    today_dt = datetime.now(timezone.utc).date()
-    today_iso = today_dt.isoformat()
-    tomorrow_iso = (today_dt + timedelta(days=1)).isoformat()
-    plus_one_iso = (today_dt + timedelta(days=2)).isoformat()
-
-    base_q = {}
-    if site_location and site_location.strip().lower() not in ('all', 'all sites'):
-        base_q['site_location'] = {'$regex': f'^{re.escape(site_location.strip())}$', '$options': 'i'}
-
-    total = await db.clients.count_documents(base_q)
-    by_stage = {}
-    pipeline = []
-    if base_q:
-        pipeline.append({'$match': base_q})
-    pipeline.append({'$group': {'_id': '$stage', 'count': {'$sum': 1}}})
-    async for d in db.clients.aggregate(pipeline):
-        by_stage[d['_id'] or 'Unknown'] = d['count']
-
-    # Pipeline counts
-    today_bookings = await db.clients.count_documents({**base_q, 'delivery_date': today_iso})
-    today_completed = await db.clients.count_documents({**base_q, 'delivery_date': today_iso, 'stage': 'Delivered'})
-    tomorrow_bookings = await db.clients.count_documents({**base_q, 'delivery_date': tomorrow_iso})
-    plus_one_bookings = await db.clients.count_documents({**base_q, 'delivery_date': plus_one_iso})
-
-    arrived_pending = await db.clients.count_documents({
-        **base_q,
-        'arrived': True,
-        'stage': {'$nin': ['Delivered']},
-    })
-    not_contacted = await db.clients.count_documents({**base_q, 'contact_status': 'Not Contacted'})
-    unassigned = await db.clients.count_documents({**base_q, '$or': [{'assigned_agent_id': None}, {'assigned_agent_id': ''}]})
-    docs_outstanding = await db.clients.count_documents({**base_q, 'document_completeness': {'$in': ['Requested', 'Partial']}})
-    offers_at_risk = await db.clients.count_documents({**base_q, 'offer_status': {'$in': ['At risk', 'Ineligible']}})
-    trade_ins_at_risk = await db.clients.count_documents({**base_q, 'trade_in_status': {'$in': ['Expiring', 'Expired', 'At risk']}})
-    ready_to_register = await db.clients.count_documents({**base_q, 'registration_status': 'Ready to register'})
-    ready_to_handover = await db.clients.count_documents({**base_q, 'handover_checklist_status': 'Signed copy on file', 'activation_ready': False})
-    ready_for_delivery = await db.clients.count_documents({**base_q, 'ready_for_delivery': True, 'stage': {'$ne': 'Delivered'}})
-
-    # Leak prevention exceptions
-    unallocated_stock = await db.clients.count_documents({
-        **base_q,
-        '$or': [{'vin': None}, {'vin': ''}, {'rego': None}, {'rego': ''}],
-        'stage': {'$ne': 'Delivered'}
-    })
-    overdue_updates = await db.clients.count_documents({
-        **base_q,
-        'delivery_date': {'$lt': today_iso},
-        'stage': {'$ne': 'Delivered'}
-    })
-
-    # Action feeds
-    recent_messages = []
-    async for msg in db.messages.find({'direction': 'inbound'}).sort('sent_at', -1).limit(5):
-        recent_messages.append(_strip(msg))
-
-    recent_doc_uploads = []
-    async for client in db.clients.find({'documents': {'$exists': True, '$ne': []}}).limit(30):
-        cname = client.get('name')
-        cid = client.get('id')
-        for doc in client.get('documents', []):
-            if doc.get('status') == 'complete' or doc.get('storage_path'):
-                recent_doc_uploads.append({
-                    'client_id': cid,
-                    'client_name': cname,
-                    'document_type': doc.get('document_type'),
-                    'file_name': doc.get('file_name'),
-                    'created_at': doc.get('created_at'),
-                })
-    recent_doc_uploads.sort(key=lambda x: str(x.get('created_at') or ''), reverse=True)
-    recent_doc_uploads = recent_doc_uploads[:5]
-
-    sms_count = await db.messages.count_documents({})
-    return {
-        'total_clients': total,
-        'by_stage': by_stage,
-        'today_bookings': today_bookings,
-        'today_completed': today_completed,
-        'daily_target': 10,
-        'pipeline_today': today_bookings,
-        'pipeline_tomorrow': tomorrow_bookings,
-        'pipeline_plus_one': plus_one_bookings,
-        'arrived_pending': arrived_pending,
-        'not_contacted': not_contacted,
-        'unassigned': unassigned,
-        'sms_total': sms_count,
-        'docs_outstanding': docs_outstanding,
-        'offers_at_risk': offers_at_risk,
-        'trade_ins_at_risk': trade_ins_at_risk,
-        'ready_to_register': ready_to_register,
-        'ready_to_handover': ready_to_handover,
-        'ready_for_delivery': ready_for_delivery,
-        'unallocated_stock': unallocated_stock,
-        'overdue_updates': overdue_updates,
-        'recent_messages': recent_messages,
-        'recent_doc_uploads': recent_doc_uploads,
-    }
+    from services.delivery_dashboard import dashboard
+    return await dashboard(get_db(), user, site_location)
 
 
 # ----- Harmony Auto Excel import -----

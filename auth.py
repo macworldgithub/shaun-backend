@@ -97,7 +97,7 @@ async def get_current_user(
 
 def require_role(*roles: str):
     async def _dep(user: User = Depends(get_current_user)) -> User:
-        role = {'site_admin': 'admin', 'delivery_consultant': 'delivery'}.get(user.role, user.role)
+        role = {'site_admin': 'admin', 'delivery_specialist': 'admin', 'delivery_consultant': 'delivery'}.get(user.role, user.role)
         if role not in roles:
             raise HTTPException(status.HTTP_403_FORBIDDEN, 'Insufficient permissions')
         return user

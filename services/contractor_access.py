@@ -29,7 +29,7 @@ def job_scope(user, requested_site=None):
 def assert_job_access(user, job):
     if not job:
         raise HTTPException(404, 'Job not found')
-    if user.role not in ('contractor', 'admin', 'super_admin', 'site_admin'):
+    if user.role not in ('contractor', 'admin', 'super_admin', 'site_admin', 'delivery_specialist'):
         raise HTTPException(403, 'Contractor access required')
     assert_site_access(user, job)
     if user.role == 'contractor' and job.get('assigned_contractor_id') != user.id:
@@ -40,7 +40,7 @@ async def validate_assignment(db, actor, contractor_id, site):
     if not contractor_id:
         return None
     target = await db.users.find_one({'id': contractor_id, 'active': True})
-    if not target or target.get('deleted_at') or target.get('role') not in ('contractor', 'admin', 'super_admin', 'site_admin'):
+    if not target or target.get('deleted_at') or target.get('role') not in ('contractor', 'admin', 'super_admin', 'site_admin', 'delivery_specialist'):
         raise HTTPException(400, 'Select an active contractor or admin')
     from models import User
     from services.account_access import resolve_site

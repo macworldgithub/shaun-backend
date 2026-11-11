@@ -73,7 +73,7 @@ async def list_contractors(user: User = Depends(require_admin)):
     """List available contractors for job assignment dropdowns."""
     db = get_db()
     out = []
-    query = {'role': {'$in': ['contractor', 'admin', 'super_admin', 'site_admin']}, 'active': True, 'deleted_at': None}
+    query = {'role': {'$in': ['contractor', 'admin', 'super_admin', 'site_admin', 'delivery_specialist']}, 'active': True, 'deleted_at': None}
     site = effective_site(user)
     if site:
         match = site_filter(site)

@@ -194,6 +194,8 @@ async def broadcast_role_push(
     # Find all users with this role
     matching_users = []
     query = {'role': role, 'active': True, 'deleted_at': None}
+    if role == 'admin':
+        query['role'] = {'$in': ['admin', 'site_admin', 'delivery_specialist']}
     if site:
         from services.contractor_access import site_filter
         match = site_filter(site)
