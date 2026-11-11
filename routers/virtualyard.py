@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import Optional, List
 import re
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -84,9 +85,6 @@ async def list_deals(
     }
     mongo_sort = [(sort_field_map.get(sort_by, 'sold_date'), direction), ('invoice_id', direction)]
 
-    # Fetch total count
-    total_matching = await db.virtual_yard_deals.count_documents(query)
-
     # Aggregated metrics for active query
     pipeline_stats = [
         {'$match': query},
@@ -101,17 +99,6 @@ async def list_deals(
             }
         }
     ]
-    stats_cursor = db.virtual_yard_deals.aggregate(pipeline_stats)
-    stats_list = await stats_cursor.to_list(length=1)
-    stats = stats_list[0] if stats_list else {
-        'total_deals': 0,
-        'total_deal_value': 0.0,
-        'total_collected': 0.0,
-        'total_balance_due': 0.0,
-        'total_payments_count': 0,
-    }
-    stats.pop('_id', None)
-
     # Pagination
     skip = (page - 1) * limit
     cursor = (
@@ -121,9 +108,22 @@ async def list_deals(
         .limit(limit)
         .allow_disk_use(True)
     )
-    items = []
-    async for doc in cursor:
-        items.append(_strip(doc))
+    async def read_items():
+        return [_strip(doc) async for doc in cursor]
+
+    stats_list, items = await asyncio.gather(
+        db.virtual_yard_deals.aggregate(pipeline_stats).to_list(length=1), read_items(),
+    )
+    stats = stats_list[0] if stats_list else {
+        'total_deals': 0,
+        'total_deal_value': 0.0,
+        'total_collected': 0.0,
+        'total_balance_due': 0.0,
+        'total_payments_count': 0,
+    }
+    stats.pop('_id', None)
+
+    total_matching = stats['total_deals']
 
     total_pages = (total_matching + limit - 1) // limit if limit > 0 else 1
 

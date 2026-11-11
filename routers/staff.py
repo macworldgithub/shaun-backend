@@ -23,7 +23,7 @@ async def list_staff(site: Optional[str] = None, user: User = Depends(get_curren
     query = {'active': {'$ne': False}, 'role': {'$ne': 'contractor'}}
     if site and site.lower() not in ('all', 'all sites', 'all locations'):
         regex = site_regex(site)
-        memberships = await db.staff_site_memberships.find({'sites': regex}).to_list(length=None)
+        memberships = await db.staff_site_memberships.find({'sites': regex}, {'_id': 0, 'email': 1}).to_list(length=None)
         query['$or'] = [{field: regex} for field in ('site', 'active_site', 'locked_site')]
         if memberships:
             query['$or'].append({'email': {'$in': [re.compile(r'^\s*' + re.escape(m['email']) + r'\s*$', re.I) for m in memberships]}})

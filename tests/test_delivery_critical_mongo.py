@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import OperationFailure
 from models import ClientBase, ClientUpdate, User
@@ -82,6 +83,22 @@ def test_atomic_reservations_dashboard_and_summary_on_real_mongodb(monkeypatch):
             summary_ms = (time.perf_counter() - start) * 1000
             assert len(summary.body) < len(full.body) * 0.2
             assert 'documents' not in json.loads(summary.body)[0]
+            request = Request({'type': 'http', 'headers': []})
+            page = json.loads((await clients.paged_clients(request, user=user, page=1, limit=2, exception=None)).body)
+            assert page['total'] == 3 and page['pages'] == 2 and len(page['items']) == 2
+            await database.clients.update_many({}, {'$set': {
+                'payment_complete': True, 'pdi_complete': True, 'registration_docs_complete': True,
+            }})
+            await database.clients.update_one({'id': winner.id}, {'$set': {
+                'trade_in_flag': True, 'trade_in_status': 'Valid', 'trade_in_valid_until': '2000-01-01',
+            }})
+            ready = json.loads((await clients.paged_clients(request, user=user, page=1, limit=20,
+                                                            exception='ready_for_delivery')).body)
+            assert ready['total'] == ready['ready_count'] == len(ready['items']) == 2
+            assert all(row['ready_for_delivery'] for row in ready['items'])
+            empty = json.loads((await clients.paged_clients(request, user=user, page=1, limit=20,
+                                                            exception=None, search='not-present')).body)
+            assert empty['total'] == 0 and empty['items'] == [] and empty['ready_count'] == 2
             print(json.dumps({'race': 'one success / one HTTP 409', 'site_scoped_clients': 3,
                               'full_bytes': len(full.body), 'summary_bytes': len(summary.body),
                               'full_ms': round(full_ms, 1), 'summary_ms': round(summary_ms, 1)}))

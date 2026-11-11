@@ -67,37 +67,109 @@ async def history(user, client_id=None, requested_site=None, limit=200, phone=No
         assert_message_access(user, target)
     focus = target.get('phone') if target else phone
     query = {'phone': {'$regex': phone_pattern(focus)}} if focus else {}
-    clients = await db.clients.find(query, {'id': 1, 'name': 1, 'phone': 1, 'site_location': 1, 'site': 1}).to_list(None)
-    for c in clients:
-        c['site_location'] = c.get('site_location') or c.get('site')
-    if target:
-        target['site_location'] = target.get('site_location') or target.get('site')
-    conversations, leads = [], []
-    if lead_db is not None:
+    async def shared_conversations():
+        if lead_db is None:
+            return []
         try:
-            conversations, leads = await asyncio.wait_for(asyncio.gather(
-                lead_db.conversations.find(query).to_list(None),
-                lead_db.leads.find(query, {'phone': 1, 'dealer': 1, 'name': 1}).to_list(None),
-            ), timeout=1.5)
+            return await asyncio.wait_for(lead_db.conversations.find(query, {
+                'phone': 1, 'dealer': 1, 'prospectName': 1, 'createdAt': 1,
+                'messages.id': 1, 'messages.sender': 1, 'messages.text': 1,
+                'messages.status': 1, 'messages.createdAt': 1,
+            }).to_list(None), timeout=1.5)
         except Exception:
             logging.getLogger(__name__).warning('Shared history unavailable; serving Delivery Centre messages', exc_info=True)
-    records = clients + [{**l, 'site_location': l.get('dealer')} for l in leads]
-    messages = await db.messages.find(query).to_list(None)
+            return []
+
+    messages, conversations = await asyncio.gather(
+        db.messages.find(query).to_list(None), shared_conversations(),
+    )
+    phones = {phone_key(row.get('phone')) for row in messages + conversations if phone_key(row.get('phone'))}
+    if not messages and not conversations:
+        return []
+    # Resolve ownership only for phones actually present in this inbox. Loading
+    # every customer and lead added seconds of database transfer on each poll.
+    contact_clauses = [
+        {'phone': {'$regex': phone_pattern(phone)}} for phone in sorted(phones)
+    ]
+    client_ids = list({message['client_id'] for message in messages if message.get('client_id')})
+    if client_ids:
+        from bson import ObjectId
+        contact_clauses.append({'id': {'$in': client_ids}})
+        object_ids = [ObjectId(value) for value in client_ids if ObjectId.is_valid(value)]
+        if object_ids:
+            contact_clauses.append({'_id': {'$in': object_ids}})
+    contacts_query = query if focus else {'$or': contact_clauses}
+
+    async def shared_contacts():
+        if lead_db is None or not phones:
+            return []
+        try:
+            return await asyncio.wait_for(lead_db.leads.find({'$or': [
+                {'phone': {'$regex': phone_pattern(phone)}} for phone in sorted(phones)
+            ]}, {
+                'phone': 1, 'dealer': 1, 'name': 1,
+            }).to_list(None), timeout=1.5)
+        except Exception:
+            logging.getLogger(__name__).warning('Shared contact lookup unavailable', exc_info=True)
+            return []
+
+    clients, leads = await asyncio.gather(
+        db.clients.find(contacts_query, {'id': 1, 'name': 1, 'phone': 1, 'site_location': 1, 'site': 1}).to_list(None) if contact_clauses else asyncio.sleep(0, result=[]),
+        shared_contacts(),
+    )
+    # Joining whole inboxes used to repeatedly scan every contact and every
+    # message array for each SMS. Run the linear-time join off the event loop.
+    return await asyncio.to_thread(_merge_history, user, target, focus, requested_site,
+                                   limit, clients, messages, conversations, leads)
+
+
+def _merge_history(user, target, focus, requested_site, limit, clients, messages, conversations, leads):
+    clients_by_id, clients_by_phone_site = {}, {}
+    records_by_phone, sites_by_phone, convo_sites_by_phone = {}, {}, {}
+    originals_by_id, threads_by_id, outbound_threads_by_id = {}, {}, {}
+    for client in clients:
+        client['site_location'] = client.get('site_location') or client.get('site')
+        for identifier in (client.get('id'), str(client.get('_id'))):
+            if identifier:
+                clients_by_id.setdefault(identifier, client)
+        clients_by_phone_site.setdefault((phone_key(client.get('phone')), site_key(client.get('site_location'))), client)
+    if target:
+        target['site_location'] = target.get('site_location') or target.get('site')
+    records = clients + [{**lead, 'site_location': lead.get('dealer')} for lead in leads]
+    for record in records:
+        phone = phone_key(record.get('phone'))
+        if phone:
+            records_by_phone.setdefault(phone, []).append(record)
+            if record.get('site_location'):
+                sites_by_phone.setdefault(phone, set()).add(site_key(record['site_location']))
+    for message in messages:
+        if message.get('direction') == 'outbound':
+            originals_by_id.setdefault(str(message.get('provider_message_id')), message)
+    for conversation in conversations:
+        phone = phone_key(conversation.get('phone'))
+        if conversation.get('dealer'):
+            convo_sites_by_phone.setdefault(phone, set()).add(conversation['dealer'])
+        for message in conversation.get('messages', []):
+            identifier = str(message.get('id'))
+            threads_by_id.setdefault(identifier, conversation)
+            if message.get('sender') != 'user':
+                outbound_threads_by_id.setdefault(identifier, conversation)
     out = []
     def visible(phone, site):
         return (allowed_site(user, site)
                 and (not requested_site or requested_site == 'All Sites' or site_key(site) == site_key(requested_site))
                 and (not focus or phone_key(phone) == phone_key(focus)))
     for msg in messages:
-        client = next((c for c in clients if msg.get('client_id') and msg['client_id'] in (c.get('id'), str(c.get('_id')))), None)
-        matched = [r for r in records if phone_key(r.get('phone')) and phone_key(r.get('phone')) == phone_key(msg.get('phone'))]
-        sites = {site_key(r.get('site_location')) for r in matched if r.get('site_location')}
-        convo_sites = {c.get('dealer') for c in conversations if phone_key(c.get('phone')) == phone_key(msg.get('phone')) and c.get('dealer')}
+        client = clients_by_id.get(msg.get('client_id')) if msg.get('client_id') else None
+        normalized_phone = phone_key(msg.get('phone'))
+        matched = records_by_phone.get(normalized_phone, [])
+        sites = sites_by_phone.get(normalized_phone, set())
+        convo_sites = convo_sites_by_phone.get(normalized_phone, set())
         correlation = (msg.get('provider_response') or {}).get('original_message_id') if msg.get('direction') == 'inbound' else None
-        original = next((row for row in messages if row.get('direction') == 'outbound' and str(row.get('provider_message_id')) == str(correlation)), None) if correlation else None
-        original_client = next((c for c in clients if (original or {}).get('client_id') in (c.get('id'), str(c.get('_id')))), None) if (original or {}).get('client_id') else None
-        correlated_thread = next((c for c in conversations if any(m.get('sender') != 'user' and str(m.get('id')) == str(correlation) for m in c.get('messages', []))), None) if correlation else None
-        source_thread = next((c for c in conversations if any(str(m.get('id')) == str(msg.get('provider_message_id')) for m in c.get('messages', []))), None) if msg.get('provider_message_id') else None
+        original = originals_by_id.get(str(correlation)) if correlation else None
+        original_client = clients_by_id.get((original or {}).get('client_id'))
+        correlated_thread = outbound_threads_by_id.get(str(correlation)) if correlation else None
+        source_thread = threads_by_id.get(str(msg.get('provider_message_id'))) if msg.get('provider_message_id') else None
         site = msg.get('site') or (original or {}).get('site') or (original_client or {}).get('site_location') or (correlated_thread or {}).get('dealer') or (source_thread or {}).get('dealer') or (client or {}).get('site_location')
         if not site and len(sites) == 1:
             site = next(r.get('site_location') for r in matched if r.get('site_location'))
@@ -113,7 +185,7 @@ async def history(user, client_id=None, requested_site=None, limit=200, phone=No
     for convo in conversations:
         if not visible(convo.get('phone'), convo.get('dealer')):
             continue
-        client = next((c for c in clients if phone_key(c.get('phone')) == phone_key(convo.get('phone')) and site_key(c.get('site_location')) == site_key(convo.get('dealer'))), None)
+        client = clients_by_phone_site.get((phone_key(convo.get('phone')), site_key(convo.get('dealer'))))
         for msg in convo.get('messages', []):
             if msg.get('sender') == 'system':
                 continue

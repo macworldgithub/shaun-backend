@@ -67,8 +67,10 @@ async def ensure_indexes():
     from services.delivery_booking import ensure_booking_index
     await ensure_booking_index(db)
     await safe_index(db.clients, [('delivery_date', 1), ('created_at', -1)])
+    await safe_index(db.clients, [('delivery_date', 1), ('created_at', -1), ('id', 1)])
     await safe_index(db.clients, [('created_at', -1)])
     await safe_index(db.clients, [('site_location', 1), ('delivery_date', 1), ('created_at', -1)])
+    await safe_index(db.clients, [('site_location', 1), ('delivery_date', 1), ('created_at', -1), ('id', 1)])
     await safe_index(db.clients, [('assigned_agent_id', 1), ('delivery_date', 1), ('created_at', -1)])
     await safe_index(db.messages, [('client_id', 1), ('sent_at', -1)])
     await safe_index(db.messages, [('sent_at', -1)])

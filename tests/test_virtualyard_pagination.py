@@ -54,8 +54,9 @@ def test_deals_pages_keep_filters_totals_and_strip_mongo_ids(monkeypatch, page, 
     assert all('_id' not in item for item in body['items'])
     assert (body['page'], body['pages'], body['total']) == (page, 3, 7)
     assert body['stats'] == {'total_deals': 7}
-    query = collection.count_documents.call_args.args[0]
-    assert query == collection.find.call_args.args[0] == collection.aggregate.call_args.args[0][0]['$match']
+    collection.count_documents.assert_not_awaited()
+    query = collection.find.call_args.args[0]
+    assert query == collection.aggregate.call_args.args[0][0]['$match']
     assert query['location_name']['$regex'] == 'Nunawading'
     assert query['status'] == 'Approved'
     assert query['settlement_status'] == 'Paid'

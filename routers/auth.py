@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from datetime import datetime, timezone
+from starlette.concurrency import run_in_threadpool
 
 from db import get_db
 from services.account_access import has_platform
@@ -37,7 +38,7 @@ async def login(payload: LoginRequest, request: Request):
     user_db = UserInDB(**doc)
     if not user_db.active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, 'Account is disabled')
-    if not verify_password(payload.password, user_db.password_hash):
+    if not await run_in_threadpool(verify_password, payload.password, user_db.password_hash):
         await _audit(request, {'id': user_db.id, 'email': user_db.email}, 'login.failed')
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, 'Invalid email or password')
     if not has_platform(user_db, 'delivery_centre'):
@@ -69,12 +70,13 @@ async def change_password(
     doc = await db.users.find_one({'id': user.id})
     if not doc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'User not found')
-    if not verify_password(payload.current_password, doc['password_hash']):
+    if not await run_in_threadpool(verify_password, payload.current_password, doc['password_hash']):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Current password is incorrect')
+    password_hash = await run_in_threadpool(hash_password, payload.new_password)
     await db.users.update_one(
         {'id': user.id},
         {'$set': {
-            'password_hash': hash_password(payload.new_password),
+            'password_hash': password_hash,
             'must_change_password': False,
         }, '$inc': {'auth_version': 1}},
     )

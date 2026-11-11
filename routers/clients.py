@@ -8,6 +8,8 @@ import os
 import uuid
 import hashlib
 import gzip
+import asyncio
+import json
 import httpx
 from io import BytesIO
 from PIL import Image
@@ -29,6 +31,7 @@ from services.inspection_pdf import generate_inspection_pdf
 from services.crm_webhook import dispatch_crm_webhook
 from services.contractor_service import sync_client_updates_to_contractor_jobs
 from services.delivery_booking import booking_key, validate_day, SLOT_TIMES, slot_conflict
+from services.client_queries import client_page_query
 
 router = APIRouter(prefix='/api/clients', tags=['clients'])
 
@@ -37,6 +40,7 @@ CLIENT_PROJECTION = {field: 1 for field in Client.model_fields}
 CLIENT_PROJECTION['_id'] = 0
 CLIENT_LIST_ADAPTER = TypeAdapter(List[Client])
 SUMMARY_FIELDS = set('id name phone email vehicle rego vin delivery_date delivery_time booking_type stage salesperson secondary_salesperson delivery_consultant handover_specialist site_location assigned_agent_id contact_status arrived location pdi_complete payment_complete trade_in_flag trade_in_attached trade_in_docs_complete trade_in_status registration_docs_complete registration_status document_completeness ready_for_delivery offer_status trade_in_valid_until created_at'.split())
+CALENDAR_FIELDS = set('id name vehicle rego delivery_date delivery_time booking_type stage site_location arrived location pdi_complete payment_complete trade_in_flag trade_in_attached trade_in_docs_complete trade_in_status trade_in_valid_until registration_docs_complete registration_status document_completeness ready_for_delivery'.split())
 
 
 def _accepts_gzip(accept_encoding):
@@ -55,16 +59,33 @@ def _accepts_gzip(accept_encoding):
     return encodings.get('gzip', encodings.get('*', 0)) > 0
 
 
-def _client_list_response(rows, accept_encoding='', summary=False):
-    # Validate business rules once and encode directly to JSON bytes. Running this
-    # in a worker keeps large lists from blocking unrelated API requests.
-    clients = CLIENT_LIST_ADAPTER.validate_python(rows)
-    body = CLIENT_LIST_ADAPTER.dump_json(clients, include={'__all__': SUMMARY_FIELDS} if summary else None)
+def _json_bytes_response(body, accept_encoding=''):
     headers = {'Vary': 'Accept-Encoding'}
     if len(body) >= 1000 and _accepts_gzip(accept_encoding):
         body = gzip.compress(body, compresslevel=5)
         headers['Content-Encoding'] = 'gzip'
     return Response(body, media_type='application/json', headers=headers)
+
+
+def _client_list_response(rows, accept_encoding='', summary=False):
+    # Validate business rules once and encode directly to JSON bytes. Running this
+    # in a worker keeps large lists from blocking unrelated API requests.
+    clients = CLIENT_LIST_ADAPTER.validate_python(rows)
+    body = CLIENT_LIST_ADAPTER.dump_json(clients, include={'__all__': SUMMARY_FIELDS} if summary else None)
+    return _json_bytes_response(body, accept_encoding)
+
+
+def _client_page_response(rows, total, ready_count, page, limit, accept_encoding=''):
+    clients = CLIENT_LIST_ADAPTER.validate_python(rows)
+    items = CLIENT_LIST_ADAPTER.dump_json(clients, include={'__all__': SUMMARY_FIELDS})
+    metadata = json.dumps({'total': total, 'ready_count': ready_count, 'page': page,
+                           'limit': limit, 'pages': (total + limit - 1) // limit}, separators=(',', ':')).encode()
+    return _json_bytes_response(metadata[:-1] + b',"items":' + items + b'}', accept_encoding)
+
+
+def _calendar_response(rows, accept_encoding=''):
+    clients = CLIENT_LIST_ADAPTER.validate_python(rows)
+    return _json_bytes_response(CLIENT_LIST_ADAPTER.dump_json(clients, include={'__all__': CALENDAR_FIELDS}), accept_encoding)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +289,7 @@ async def list_clients(
     limit: Annotated[int, Query(ge=1, le=5000)] = 5000,
     offset: Annotated[int, Query(ge=0)] = 0,
     summary: bool = False,
+    calendar: bool = False,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ):
@@ -306,8 +328,13 @@ async def list_clients(
         ]}
         # Search narrows the selected assignment filter instead of widening it.
         q.setdefault('$and', []).append(search_filter)
+    projection = CLIENT_PROJECTION
+    if calendar:
+        projection = {**dict.fromkeys(CALENDAR_FIELDS | {'phone'}, 1), '_id': 0}
+    elif summary:
+        projection = {**dict.fromkeys(SUMMARY_FIELDS, 1), '_id': 0}
     cursor = (
-        db.clients.find(q, {**dict.fromkeys(SUMMARY_FIELDS, 1), '_id': 0} if summary else CLIENT_PROJECTION, allow_disk_use=True)
+        db.clients.find(q, projection, allow_disk_use=True)
         .sort([('delivery_date', 1), ('created_at', -1)])
         .allow_disk_use(True)
         .skip(offset)
@@ -316,6 +343,8 @@ async def list_clients(
     )
     rows = await cursor.to_list(length=limit)
     accept_encoding = request.headers.get('accept-encoding', '') if request else ''
+    if calendar:
+        return await run_in_threadpool(_calendar_response, rows, accept_encoding)
     return await run_in_threadpool(_client_list_response, rows, accept_encoding, summary)
 
 
@@ -349,6 +378,29 @@ async def create_client(payload: ClientBase, user: User = Depends(get_current_us
 # Clients — static sub-collection routes  (must precede /{client_id})
 # ---------------------------------------------------------------------------
 
+@router.get('/page')
+async def paged_clients(
+    request: Request, user: User = Depends(get_current_user),
+    page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=200),
+    site_location: Optional[str] = None, search: Optional[str] = None,
+    stage: Optional[str] = None, contact_status: Optional[str] = None,
+    assigned_agent_id: Optional[str] = None, mine: bool = False,
+    unassigned: bool = False,
+    exception: Optional[str] = Query(None, pattern='^(ready_for_delivery|overdue|trade_in|unallocated|docs)$'),
+):
+    db = get_db()
+    query, readiness = client_page_query(user, site_location, search, stage, contact_status,
+                                         assigned_agent_id, unassigned, mine, exception)
+    cursor = (db.clients.find(query, {**dict.fromkeys(SUMMARY_FIELDS, 1), '_id': 0})
+              .sort([('delivery_date', 1), ('created_at', -1), ('id', 1)])
+              .skip((page - 1) * limit).limit(limit).batch_size(limit))
+    rows, total, ready_count = await asyncio.gather(
+        cursor.to_list(limit), db.clients.count_documents(query), db.clients.count_documents(readiness),
+    )
+    return await run_in_threadpool(_client_page_response, rows, total, ready_count, page, limit,
+                                   request.headers.get('accept-encoding', ''))
+
+
 @router.get('/available-slots')
 async def available_slots(day: str, site_location: Optional[str] = None,
                           exclude_client_id: Optional[str] = None,
@@ -379,7 +431,19 @@ async def client_alerts(user: User = Depends(get_current_user)):
     locked = effective_site(user)
     if locked:
         alert_q['site_location'] = {'$regex': f'^{re.escape(locked.strip())}$', '$options': 'i'}
-    async for client in db.clients.find(alert_q).limit(500):
+    # Alert cards need a handful of fields, not document bodies/import payloads.
+    rows = await db.clients.find(alert_q, {
+        '_id': 0, 'id': 1, 'name': 1, 'trade_in_valid_until': 1,
+        'document_completeness': 1, 'linked_offer_ids': 1,
+    }).limit(500).to_list(500)
+    offer_ids = list({offer_id for row in rows for offer_id in row.get('linked_offer_ids', [])})
+    offers = await db.offers.find({'id': {'$in': offer_ids}}, {
+        '_id': 0, 'id': 1, 'name': 1, 'order_to': 1, 'deliver_by': 1,
+    }).to_list(None) if offer_ids else []
+    offers_by_id = {}
+    for offer in offers:
+        offers_by_id.setdefault(offer['id'], offer)
+    for client in rows:
         client_id = client.get('id')
         name = client.get('name', 'Client')
         valid_until = client.get('trade_in_valid_until')
@@ -409,7 +473,7 @@ async def client_alerts(user: User = Depends(get_current_user)):
                 'message': f'{name}: registration documents are {str(client.get("document_completeness")).lower()}',
             })
         for offer_id in client.get('linked_offer_ids', []):
-            offer = await db.offers.find_one({'id': offer_id})
+            offer = offers_by_id.get(offer_id)
             if not offer:
                 continue
             for field, label in (('order_to', 'order window'), ('deliver_by', 'delivery deadline')):
