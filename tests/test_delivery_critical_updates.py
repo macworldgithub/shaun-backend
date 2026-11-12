@@ -38,8 +38,8 @@ def cursor(rows):
 
 @pytest.fixture
 def api(monkeypatch):
-    db = SimpleNamespace(clients=MagicMock(), messages=MagicMock(), users=MagicMock())
-    for collection in (db.clients, db.messages, db.users):
+    db = SimpleNamespace(clients=MagicMock(), messages=MagicMock(), users=MagicMock(), sms_reply_notifications=MagicMock())
+    for collection in (db.clients, db.messages, db.users, db.sms_reply_notifications):
         collection.find.return_value = cursor([])
         collection.find_one = AsyncMock(return_value=None)
         collection.insert_one = AsyncMock()

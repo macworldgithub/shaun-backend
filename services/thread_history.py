@@ -23,6 +23,8 @@ def allowed_site(user, site):
     sites = getattr(user, 'allowed_sites', None)
     if sites is not None and not getattr(user, 'all_sites', False):
         return bool(site_key(site)) and any(site_key(site) == site_key(s) for s in sites)
+    if getattr(user, 'all_sites', False):
+        return bool(site_key(site))
     if user.role in ('super_admin', 'admin', 'site_admin', 'delivery_specialist'):
         return True
     return bool(site_key(user.active_site)) and site_key(site) == site_key(user.active_site)

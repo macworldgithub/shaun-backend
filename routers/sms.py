@@ -49,6 +49,10 @@ async def list_messages(
 async def _record_message(client_id: Optional[str], client_name: Optional[str], phone: str, body: str, user: User, result: dict, site: Optional[str] = None) -> Message:
     db = get_db()
     client_doc = await db.clients.find_one({'id': client_id}) if client_id else None
+    if not client_doc and client_id:
+        from bson import ObjectId
+        if ObjectId.is_valid(client_id):
+            client_doc = await db.clients.find_one({'_id': ObjectId(client_id)})
     msg = Message(
         client_id=client_id,
         client_name=client_name,
@@ -64,7 +68,7 @@ async def _record_message(client_id: Optional[str], client_name: Optional[str], 
     await db.messages.insert_one(msg.model_dump(mode='json'))
     if client_id:
         await db.clients.update_one(
-            {'id': client_id},
+            {'_id': client_doc['_id']} if client_doc and client_doc.get('_id') is not None else {'id': client_id},
             {'$set': {
                 'last_contacted_at': datetime.now(timezone.utc),
                 'contact_status': 'Awaiting Reply',
@@ -85,6 +89,10 @@ async def send_message(payload: SendSmsRequest, user: User = Depends(get_current
     if client_id:
         client_doc = await db.clients.find_one({'id': client_id})
         if not client_doc:
+            from bson import ObjectId
+            if ObjectId.is_valid(client_id):
+                client_doc = await db.clients.find_one({'_id': ObjectId(client_id)})
+        if not client_doc:
             raise HTTPException(404, 'Client not found')
         assert_message_access(user, client_doc)
         phone = client_doc['phone']
@@ -95,7 +103,7 @@ async def send_message(payload: SendSmsRequest, user: User = Depends(get_current
         clients = await db.clients.find({'phone': {'$regex': phone_pattern(phone)}}).to_list(None)
         client_doc = next((c for c in clients if phone_key(c.get('phone')) == phone_key(phone) and allowed_site(user, c.get('site_location') or c.get('site')) and (not payload.site or site_key(c.get('site_location') or c.get('site')) == site_key(payload.site))), None)
         if client_doc:
-            client_id = client_doc['id']
+            client_id = client_doc.get('id') or str(client_doc['_id'])
             client_name = client_doc['name']
         else:
             leads = await get_lead_db().leads.find({'phone': {'$regex': phone_pattern(phone)}}).to_list(None)
@@ -237,7 +245,7 @@ async def mobilemessage_inbound(request: Request):
         client_doc = next((c for c in clients if site and site_key(c.get('site_location') or c.get('site')) == site_key(site)), None)
 
         msg = Message(
-            client_id=(client_doc or {}).get('id'),
+            client_id=(client_doc or {}).get('id') or (str(client_doc['_id']) if client_doc and client_doc.get('_id') is not None else None),
             client_name=(client_doc or {}).get('name'),
             phone=from_phone or 'unknown',
             body=body,
@@ -255,9 +263,16 @@ async def mobilemessage_inbound(request: Request):
             await db.messages.update_one({'_id': ObjectId(inbound_document_id(msg.provider_message_id))}, {'$setOnInsert': record}, upsert=True)
         else:
             await db.messages.insert_one(record)
+        from services.sms_reply_notifications import record_reply
+        lead_doc = next((row for row in leads if site and site_key(row.get('dealer') or row.get('site')) == site_key(site)), {})
+        await record_reply(db, record, {
+            'name': lead_doc.get('name'), 'lead_id': str(lead_doc['_id']) if lead_doc.get('_id') is not None else None,
+            'client_id': (client_doc or {}).get('id'),
+            'customer_id': (client_doc or {}).get('crm_customer_id') or lead_doc.get('customerId') or lead_doc.get('customer_id'),
+        })
         if client_doc:
             await db.clients.update_one(
-                {'id': client_doc['id']},
+                {'_id': client_doc['_id']} if client_doc.get('_id') is not None else {'id': client_doc['id']},
                 {'$set': {
                     'contact_status': 'Contacted',
                     'last_contacted_at': datetime.now(timezone.utc),

@@ -72,6 +72,7 @@ async def ensure_indexes():
     await safe_index(db.clients, [('assigned_agent_id', 1), ('delivery_date', 1), ('created_at', -1)])
     await safe_index(db.messages, [('client_id', 1), ('sent_at', -1)])
     await safe_index(db.messages, [('sent_at', -1)])
+    await safe_index(db.sms_reply_notifications, [('site', 1), ('created_at', -1), ('_id', -1)])
     await safe_index(db.share_links, 'token', unique=True)
     await safe_index(db.upload_links, 'token', unique=True)
     await safe_index(db.upload_links, 'client_id')
