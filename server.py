@@ -8,6 +8,7 @@ from db import ensure_indexes, close
 from seed import bootstrap
 from routers.auth import router as auth_router
 from routers.clients import router as clients_router
+from routers.sales_handoff import router as sales_handoff_router
 from routers.sms import router as sms_router
 from routers.admin import router as admin_router
 from routers.share import router as share_router
@@ -69,6 +70,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(sales_handoff_router)
 app.include_router(clients_router)
 app.include_router(sms_router)
 app.include_router(admin_router)

@@ -107,6 +107,8 @@ class Comment(BaseModel):
     author_id: Optional[str] = None
     author_name: str
     body: str
+    channel: Optional[str] = None
+    team: Optional[str] = None
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -127,6 +129,10 @@ class ClientBase(BaseModel):
     vin: Optional[str] = None
     po_number: Optional[str] = None
     payment_method: Optional[str] = None  # Cash / Finance / Novated lease / Other
+    delivery_handoff: Optional[dict] = None
+    handoff_status: Optional[str] = None
+    sales_unread: int = 0
+    delivery_unread: int = 0
     payment_complete: bool = False
     trade_in_docs_complete: bool = False
     pdi_complete: bool = False
