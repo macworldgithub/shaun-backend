@@ -3,7 +3,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from services.account_access import site_key
 from pydantic import BaseModel, Field, field_validator
 from auth import get_current_user, effective_site, assert_site_access
 from db import get_db
@@ -43,19 +44,29 @@ async def notifications(user: User = Depends(get_current_user)):
     query = {'$or': [{'handoff_status': 'new'}, {'delivery_unread': {'$gt': 0}}]}
     site = effective_site(user)
     if site:
-        query['site_location'] = {'$regex': f'^{re.escape(site.strip())}$', '$options': 'i'}
+        clean = re.sub(r'^BYD\s+', '', site.strip(), flags=re.I)
+        clean = re.sub(r',?\s+VIC$', '', clean, flags=re.I)
+        pattern = r'Melbourne(?:\s+City)?' if site_key(clean) == 'melbournecity' else re.escape(clean)
+        query['site_location'] = {'$regex': r'^(?:BYD\s+)?' + pattern + r'(?:,?\s+VIC)?$', '$options': 'i'}
     return await get_db().clients.find(query, {
         '_id': 0, 'id': 1, 'name': 1, 'handoff_status': 1, 'delivery_unread': 1,
     }).limit(100).to_list(100)
 
 
 @router.get('/{client_id}/sales-chat')
-async def conversation(client_id: str, user: User = Depends(get_current_user)):
+async def conversation(client_id: str, before: Optional[str] = Query(default=None, min_length=1, max_length=100), user: User = Depends(get_current_user)):
     client = await client_for(client_id, user)
+    messages = [c for c in client.get('comments', []) if c.get('channel') == 'sales_delivery']
+    end = len(messages)
+    if before is not None:
+        end = next((i for i, message in enumerate(messages) if message.get('id') == before), -1)
+        if end < 0:
+            raise HTTPException(400, 'Conversation cursor not found. Refresh the customer profile.')
+    start = max(0, end - 100)
     return {'handoff': client.get('delivery_handoff'), 'status': client.get('handoff_status'),
             'linked_to_sales': bool(client.get('crm_customer_id')), 'unread': client.get('delivery_unread', 0),
             'last_sales_message_id': client.get('last_sales_message_id'),
-            'messages': [c for c in client.get('comments', []) if c.get('channel') == 'sales_delivery'][-100:]}
+            'messages': messages[start:end], 'has_more': start > 0}
 
 
 @router.post('/{client_id}/sales-chat/read')

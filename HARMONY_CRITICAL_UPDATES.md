@@ -43,3 +43,7 @@ venv/Scripts/python.exe scripts/smoke_delivery_sms.py --to +61499918523 --sender
 ```
 
 On 11 November 2026, MobileMessage reported `delivered` for the authorized test from `+61408622037` to `+61499918523` (message ID `bb6a4125-3932-4b19-ac8d-de17e0397744`). A real `HARMONY OK` handset reply must be observed to complete live forwarding verification; simulated webhook regressions are separate evidence.
+
+## CRM client-card handoff follow-up
+
+`GET /api/clients/:id/sales-chat?before=<message-id>` opens earlier retained messages in pages of 100. The response includes `has_more`; invalid cursors fail without writes. Handoff notification filters include dealership aliases (for example Melbourne and BYD Melbourne City VIC) within the selected site. Shared structured Sold fields and attributed internal chat remain in the existing customer record.

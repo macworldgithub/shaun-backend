@@ -65,3 +65,28 @@ def test_read_marker_is_guarded_against_a_new_message_race(monkeypatch):
     api, db, _ = fixture(monkeypatch)
     assert api.post('/api/clients/client-1/sales-chat/read', json={'last_message_id': 'last-seen'}).status_code == 200
     assert db.clients.update_one.call_args.args[0]['last_sales_message_id'] == 'last-seen'
+
+
+def test_retained_chat_history_pages_survive_new_messages(monkeypatch):
+    api, db, row = fixture(monkeypatch)
+    row['comments'] = [{'id': f'm-{i}', 'channel': 'sales_delivery', 'body': str(i)} for i in range(205)]
+    latest = api.get('/api/clients/client-1/sales-chat').json()
+    assert latest['has_more'] and len(latest['messages']) == 100
+    row['comments'].append({'id': 'new-reply', 'channel': 'sales_delivery'})
+    earlier = api.get('/api/clients/client-1/sales-chat', params={'before': latest['messages'][0]['id']}).json()
+    first = api.get('/api/clients/client-1/sales-chat', params={'before': earlier['messages'][0]['id']}).json()
+    assert not first['has_more']
+    assert [m['id'] for m in first['messages'] + earlier['messages'] + latest['messages']] == [f'm-{i}' for i in range(205)]
+    assert api.get('/api/clients/client-1/sales-chat?before=unknown').status_code == 400
+    assert api.get('/api/clients/client-1/sales-chat?before=').status_code == 422
+
+
+def test_notifications_include_site_aliases_without_other_dealerships(monkeypatch):
+    import re
+    api, db, row = fixture(monkeypatch, 'BYD Melbourne City')
+    db.clients.find.return_value.limit.return_value.to_list = AsyncMock(return_value=[])
+    assert api.get('/api/clients/handoff-notifications').status_code == 200
+    regex = db.clients.find.call_args.args[0]['site_location']['$regex']
+    assert re.fullmatch(regex, 'Melbourne', re.I)
+    assert re.fullmatch(regex, 'BYD Melbourne City VIC', re.I)
+    assert not re.fullmatch(regex, 'BYD Fairfield', re.I)
