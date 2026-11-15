@@ -140,6 +140,25 @@ def test_concurrent_workers_claim_once_and_timeout_retry_keeps_key_and_payload(m
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('has_owner', [True, False])
+def test_reminder_can_be_assigned_to_a_sales_floor_only_user(has_owner):
+    async def run():
+        db = database()
+        db.users.rows = [{'_id': 'floor-user', 'name': 'Alex Sales', 'active': True,
+                          'role': 'sales_consultant', 'platform_access': ['sales_floor'], 'site': 'BYD Fairfield'}]
+        if has_owner:
+            db.customers.rows[0]['owner_user_id'] = 'floor-user'
+            # The canonical owner wins even if CRM has a separate account with the same name.
+            db.users.rows.append({**db.users.rows[0], '_id': 'crm-user', 'platform_access': ['crm']})
+        else:
+            db.customers.rows[0].pop('owner_user_id')
+        await service.ensure_jobs(db, db.clients.rows[0])
+        job = next(row for row in db.post_delivery_jobs.rows if row['step'] == 'sales_followup')
+        await service.process_job(db, job['_id'], job['due_at'], AsyncMock())
+        assert db.post_delivery_followups.rows[0]['salesperson_id'] == 'floor-user'
+    asyncio.run(run())
+
+
 def test_changed_recipient_is_held_for_review_instead_of_sending_to_the_old_number():
     async def run():
         db = database(); await service.ensure_jobs(db, db.clients.rows[0])

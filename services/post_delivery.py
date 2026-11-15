@@ -108,7 +108,7 @@ async def create_sales_reminder(db, job, client, customer, body, now):
         users = await db.users.find({'active': {'$ne': False}, 'name': {'$regex': '^' + re.escape(name) + '$', '$options': 'i'}}).to_list(50)
         site = site_key(client.get('site_location'))
         candidates = [user for user in users if not user.get('deleted_at') and user.get('role') != 'contractor'
-                      and (user.get('platform_access') is None or 'crm' in user['platform_access'])
+                      and (user.get('platform_access') is None or any(platform in user['platform_access'] for platform in ('crm', 'sales_floor')))
                       and (user.get('all_sites') or site_key(user.get('site') or user.get('active_site') or user.get('locked_site')) == site
                            or any(site_key(value) == site for value in user.get('allowed_sites') or []))]
         user = next((user for user in candidates if str(user['_id']) == str(assignee_id)), None)

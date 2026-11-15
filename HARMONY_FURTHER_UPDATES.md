@@ -22,3 +22,7 @@ No new credentials are required. Existing MobileMessage credentials and sender c
 Deploy this backend and the shared CRM API before the frontends. Preserve `.env`, uploads and rollback builds. The rollout does not enroll historical deliveries or issue a test SMS to a customer. Isolated tests and disposable MongoDB concurrency tests use a fake SMS provider; production acceptance uses opted-out synthetic records.
 
 Provider retry contract: [MobileMessage SMS API documentation](https://mobilemessage.com.au/api-documentation). Keys are retained for 24 hours; automated retries stop before that window expires.
+
+## Sales Floor reminder assignment
+
+New day-3 reminders can be assigned to an active salesperson with either CRM or Sales Floor platform access. The canonical customer owner wins over another eligible account with the same name; a unique matching salesperson at the delivery site can also be resolved when no owner ID is present. Both applications share the same reminder record; automated customer texts remain a single sequence.
