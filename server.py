@@ -18,6 +18,8 @@ from routers.contractor_users import router as contractor_users_router
 from routers.virtualyard import router as virtualyard_router
 from routers.staff import router as staff_router
 from services.notifications import scheduled_workflow_worker
+from services.post_delivery import worker as post_delivery_worker
+from routers.post_delivery import router as post_delivery_router
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 log = logging.getLogger('app')
@@ -27,6 +29,7 @@ log = logging.getLogger('app')
 async def lifespan(app: FastAPI):
     workflow_task = None
     integration_task = None
+    post_delivery_task = None
     # ---- startup ----
     try:
         await ensure_indexes()
@@ -38,10 +41,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.exception("Startup error: %s", e)
 
+    post_delivery_task = asyncio.create_task(post_delivery_worker())
     yield  # app runs here
 
     # ---- shutdown ----
     try:
+        if post_delivery_task:
+            post_delivery_task.cancel()
+            try:
+                await post_delivery_task
+            except asyncio.CancelledError:
+                pass
         if integration_task:
             integration_task.cancel()
             try:
@@ -72,6 +82,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(sales_handoff_router)
+app.include_router(post_delivery_router)
 app.include_router(sms_reply_notifications_router)
 app.include_router(clients_router)
 app.include_router(sms_router)

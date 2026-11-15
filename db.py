@@ -80,6 +80,8 @@ async def ensure_indexes():
     await safe_index(db.offer_snapshots, [('fetched_at', -1)])
     await safe_index(db.share_views, [('share_link_id', 1), ('viewed_at', -1)])
     await safe_index(db.audit, [('created_at', -1)])
+    await safe_index(db.post_delivery_jobs, [('status', 1), ('due_at', 1)])
+    await safe_index(db.post_delivery_followups, [('salesperson_id', 1), ('status', 1), ('due_at', 1)])
     # Contractor App indexes
     await safe_index(db.contractor_jobs, 'id', unique=True)
     await safe_index(db.contractor_jobs, 'client_id')

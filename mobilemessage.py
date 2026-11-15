@@ -46,10 +46,10 @@ def normalise_au(phone: str) -> str:
     return digits
 
 
-def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
+def _send_sync(to: str, body: str, custom_ref: Optional[str] = None, idempotency_key: Optional[str] = None, sender: Optional[str] = None) -> dict:
     username = os.environ.get('MOBILEMESSAGE_USERNAME') or MOBILEMESSAGE_USERNAME
     password = os.environ.get('MOBILEMESSAGE_PASSWORD') or os.environ.get('MOBILEMESSAGE_API_KEY') or MOBILEMESSAGE_PASSWORD
-    from_sender = os.environ.get('MOBILEMESSAGE_SENDER_ID') or os.environ.get('MOBILEMESSAGE_FROM') or MOBILEMESSAGE_FROM or 'HARMONY'
+    from_sender = sender or os.environ.get('MOBILEMESSAGE_SENDER_ID') or os.environ.get('MOBILEMESSAGE_FROM') or MOBILEMESSAGE_FROM or 'HARMONY'
     url = MOBILEMESSAGE_URL
 
     if not username or not password:
@@ -71,7 +71,7 @@ def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
             url,
             auth=(username, password),
             json=payload,
-            headers={'Idempotency-Key': str(uuid.uuid4())},
+            headers={'Idempotency-Key': idempotency_key or str(uuid.uuid4())},
             timeout=20,
         )
         try:
@@ -83,6 +83,7 @@ def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
             return {
                 'success': False,
                 'status': 'rate_limited',
+                'retryable': True,
                 'error': 'Too many concurrent requests (max 5)',
                 'response': data,
             }
@@ -111,16 +112,17 @@ def _send_sync(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
         return {
             'success': False,
             'status': 'failed',
+            'retryable': r.status_code == 409 or r.status_code >= 500,
             'error': (data.get('message') if isinstance(data, dict) else None) or f'HTTP {r.status_code}',
             'response': data,
         }
     except requests.RequestException as e:
         log.exception('MobileMessage send failed')
-        return {'success': False, 'status': 'error', 'error': str(e)}
+        return {'success': False, 'status': 'error', 'retryable': True, 'error': str(e)}
 
 
-async def send_sms(to: str, body: str, custom_ref: Optional[str] = None) -> dict:
-    return await asyncio.to_thread(_send_sync, to, body, custom_ref)
+async def send_sms(to: str, body: str, custom_ref: Optional[str] = None, idempotency_key: Optional[str] = None, sender: Optional[str] = None) -> dict:
+    return await asyncio.to_thread(_send_sync, to, body, custom_ref, idempotency_key, sender)
 
 
 def render_template(body: str, data: dict) -> str:

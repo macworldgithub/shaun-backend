@@ -60,3 +60,12 @@ def test_branded_sender_overrides_legacy_number():
         result = mobilemessage._send_sync('0499918523', 'Hello from Harmony')
     assert result['success'] is True
     assert result['message_id'] == 'harmony-id'
+
+
+def test_automation_retries_preserve_the_supplied_provider_key_and_sender():
+    key = str(uuid.uuid4())
+    with environment(), patch.object(mobilemessage.requests, 'post', return_value=SimpleNamespace(status_code=503, json=lambda: {'message': 'retry'})) as post:
+        result = mobilemessage._send_sync('0400000000', 'Delivery text', 'step-reference', key, '+61408622037')
+    assert result['retryable'] is True
+    assert post.call_args.kwargs['headers']['Idempotency-Key'] == key
+    assert post.call_args.kwargs['json']['messages'][0]['sender'] == '+61408622037'

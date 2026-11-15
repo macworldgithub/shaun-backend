@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from typing import Annotated, Optional, List
 from datetime import datetime, timezone, timedelta
@@ -349,7 +349,7 @@ async def list_clients(
 
 
 @router.post('', response_model=Client, status_code=status.HTTP_201_CREATED)
-async def create_client(payload: ClientBase, user: User = Depends(get_current_user)):
+async def create_client(payload: ClientBase, user: User = Depends(get_current_user), background_tasks: BackgroundTasks = None):
     db = get_db()
     _validate_sale_type(payload.sale_type, payload.fleet_company)
     if payload.activation_status in ('Ready', 'Submitted to BYD', 'Active') and not _has_signed_handover(
@@ -366,12 +366,16 @@ async def create_client(payload: ClientBase, user: User = Depends(get_current_us
     if effective_site(user):
         client.site_location = effective_site(user)
     record = client.model_dump(mode='json')
+    from services.post_delivery import delivery_transition, process_client
+    record.update(delivery_transition({}, record))
     record['delivery_slot_key'] = booking_key(record)
     try:
         await db.clients.insert_one(record)
     except DuplicateKeyError:
         raise slot_conflict()
-    return client
+    if record.get('post_delivery_enrollment_id') and background_tasks is not None:
+        background_tasks.add_task(process_client, db, client.id)
+    return Client(**record)
 
 
 # ---------------------------------------------------------------------------
@@ -858,7 +862,7 @@ async def get_client(client_id: str, user: User = Depends(get_current_user)):
 
 @router.patch('/{client_id}', response_model=Client)
 async def update_client(
-    client_id: str, payload: ClientUpdate, user: User = Depends(get_current_user),
+    client_id: str, payload: ClientUpdate, user: User = Depends(get_current_user), background_tasks: BackgroundTasks = None,
 ):
     db = get_db()
     update = {
@@ -944,7 +948,12 @@ async def update_client(
     update['ready_for_delivery'] = bool(payment_ok and trade_in_ok and pdi_ok and rego_ok)
 
     update['updated_at'] = datetime.now(timezone.utc)
+    from services.post_delivery import delivery_transition, process_client
+    transition = delivery_transition(existing, update)
+    update.update(transition)
     match = {'id': client_id}
+    if transition:
+        match['stage'] = existing.get('stage')
     if booking_changed:
         # Two concurrent edits to the same customer must not leave date/time and
         # the unique reservation key describing different slots.
@@ -956,7 +965,7 @@ async def update_client(
     except DuplicateKeyError:
         raise slot_conflict()
     if not res:
-        if booking_changed:
+        if booking_changed or transition:
             raise HTTPException(409, 'This booking changed while you were editing. Refresh and try again.')
         raise HTTPException(404, 'Client not found')
 
@@ -997,6 +1006,8 @@ async def update_client(
     except Exception as exc:
         pass
 
+    if transition and background_tasks is not None:
+        background_tasks.add_task(process_client, db, client_id)
     return Client(**_strip(res))
 
 

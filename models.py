@@ -127,6 +127,10 @@ class ClientBase(BaseModel):
     vehicle: str
     rego: Optional[str] = None
     vin: Optional[str] = None
+    vehicle_make: Optional[str] = None
+    vehicle_model: Optional[str] = None
+    customer_type: Literal['Private', 'Business'] = 'Private'
+    sms_opt_out: bool = False
     po_number: Optional[str] = None
     payment_method: Optional[str] = None  # Cash / Finance / Novated lease / Other
     delivery_handoff: Optional[dict] = None
@@ -312,6 +316,8 @@ class Client(ClientBase):
     comments: List[Comment] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
+    delivered_at: Optional[datetime] = None
+    post_delivery_enrollment_id: Optional[str] = None
 
 
 class ClientUpdate(BaseModel):
@@ -322,6 +328,10 @@ class ClientUpdate(BaseModel):
     vehicle: Optional[str] = None
     rego: Optional[str] = None
     vin: Optional[str] = None
+    vehicle_make: Optional[str] = None
+    vehicle_model: Optional[str] = None
+    customer_type: Optional[Literal['Private', 'Business']] = None
+    sms_opt_out: Optional[bool] = None
     po_number: Optional[str] = None
     payment_method: Optional[str] = None
     payment_complete: Optional[bool] = None
