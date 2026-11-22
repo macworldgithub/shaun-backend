@@ -118,6 +118,8 @@ async def require_user_manager(user: User = Depends(get_current_user)) -> User:
 
 def effective_site(user: User, requested: Optional[str] = None) -> Optional[str]:
     """Site-locked users are always pinned to their locked_site, whatever was requested."""
+    if str(getattr(user, 'email', '')).strip().lower() == 'nunawading@byd.com':
+        return 'BYD Nunawading'
     locked = getattr(user, 'request_site', None) or getattr(user, 'locked_site', None)
     if locked:
         return locked
@@ -126,7 +128,10 @@ def effective_site(user: User, requested: Optional[str] = None) -> Optional[str]
 
 def assert_site_access(user: User, doc: Optional[dict]) -> None:
     """Raise 404 when a site-locked user touches a record from another site."""
-    locked = getattr(user, 'request_site', None) or getattr(user, 'locked_site', None)
+    if str(getattr(user, 'email', '')).strip().lower() == 'nunawading@byd.com':
+        locked = 'BYD Nunawading'
+    else:
+        locked = getattr(user, 'request_site', None) or getattr(user, 'locked_site', None)
     if not locked or not doc:
         return
     if site_key(doc.get('site_location')) != site_key(locked):
